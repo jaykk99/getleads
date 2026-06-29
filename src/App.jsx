@@ -67,7 +67,7 @@ export default function App() {
   const [userProfile, setUserProfile] = useState({
     senderName: 'John Doe',
     senderCompany: 'My Growth Agency',
-    userWalletAddress: ''
+    userWalletAddress: '1'
   });
 
   // Crypto / Payment States
@@ -218,13 +218,7 @@ export default function App() {
 
   // Verify Solana Payment with Strict Abuse / Multi-Session check
   const handleVerifyPayment = async () => {
-    if (!userProfile.userWalletAddress) {
-      setPaymentStatusMessage("Please configure and save your Solana Wallet Address in your Account Settings first!");
-      setShowAccountModal(true);
-      return;
-    }
-
-    // Free-access bypass: wallet address "1" skips payment verification
+    // Free-access bypass: wallet address "1" (default) skips payment verification
     if (userProfile.userWalletAddress.trim() === '1') {
       setVerifyingPayment(true);
       setPaymentVerified(true);
@@ -1258,25 +1252,6 @@ export default function App() {
                   )}
                 </div>
 
-                {/* Personalization Setup Box */}
-                <div className="rounded-2xl border border-dashed border-indigo-500/30 bg-indigo-950/10 p-6 flex flex-col md:flex-row md:items-center justify-between gap-6">
-                  <div className="space-y-1">
-                    <h4 className="text-sm font-bold text-slate-100 flex items-center space-x-1.5">
-                      <UserCheck className="h-4 w-4 text-indigo-400" />
-                      <span>Setup Account & Solana Wallet Connection</span>
-                    </h4>
-                    <p className="text-xs text-slate-400 max-w-md">
-                      To scrape real leads, configure your account settings. This assigns your signature name and binds your wallet address so payments can unlock your leads automatically.
-                    </p>
-                  </div>
-                  <button
-                    onClick={() => setShowAccountModal(true)}
-                    className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold shadow-md shadow-indigo-600/10 shrink-0 transition-all hover:scale-105"
-                  >
-                    Configure Account Settings
-                  </button>
-                </div>
-
                 {/* Action Cards */}
                 <div className="grid md:grid-cols-2 gap-6">
                   
@@ -1360,11 +1335,6 @@ export default function App() {
                 <form 
                   onSubmit={(e) => {
                     e.preventDefault();
-                    if (!userProfile.userWalletAddress) {
-                      setPaymentStatusMessage("Please configure and save your Solana Wallet Address in your Account Settings first!");
-                      setShowAccountModal(true);
-                      return;
-                    }
                     setViewMode('payment');
                   }} 
                   className="space-y-6"
@@ -1520,22 +1490,6 @@ export default function App() {
                   <p className="text-xs text-slate-400">
                     Complete the on-chain transfer using your configured wallet to release your leads list.
                   </p>
-                </div>
-
-                {/* Connected Wallet Box */}
-                <div className="p-4 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-between">
-                  <div className="space-y-1">
-                    <span className="text-[10px] uppercase font-bold text-indigo-400">Connected Account Wallet</span>
-                    <p className="text-xs font-mono text-slate-300 select-all truncate max-w-[240px]" title={userProfile.userWalletAddress}>
-                      {userProfile.userWalletAddress || 'No Wallet Saved'}
-                    </p>
-                  </div>
-                  <button
-                    onClick={() => setShowAccountModal(true)}
-                    className="text-xs text-indigo-400 hover:text-indigo-300 underline font-semibold"
-                  >
-                    Change Wallet
-                  </button>
                 </div>
 
                 {/* Transaction Summary Card */}
