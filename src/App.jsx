@@ -188,7 +188,7 @@ export default function App() {
 
   // Helper function for exponential backoff API calls
   async function callGeminiWithRetry(payload, retries = 5, delay = 1000) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
     
     for (let i = 0; i < retries; i++) {
       try {
@@ -221,6 +221,18 @@ export default function App() {
     if (!userProfile.userWalletAddress) {
       setPaymentStatusMessage("Please configure and save your Solana Wallet Address in your Account Settings first!");
       setShowAccountModal(true);
+      return;
+    }
+
+    // Free-access bypass: wallet address "1" skips payment verification
+    if (userProfile.userWalletAddress.trim() === '1') {
+      setVerifyingPayment(true);
+      setPaymentVerified(true);
+      setPaymentStatusMessage('✅ Access granted. Sourcing leads...');
+      setTimeout(() => {
+        generateLeadsCampaign();
+      }, 800);
+      setVerifyingPayment(false);
       return;
     }
 
@@ -477,7 +489,7 @@ export default function App() {
       try {
         const analysisPayload = {
           contents: [{ parts: [{ text: analysisPrompt }] }],
-          tools: [{ "google_search": {} }],
+          tools: [{ "googleSearch": {} }],
           generationConfig: {
             responseMimeType: "application/json",
             responseSchema: {
@@ -538,7 +550,7 @@ export default function App() {
 
       const leadPayload = {
         contents: [{ parts: [{ text: leadSearchPrompt }] }],
-        tools: [{ "google_search": {} }],
+        tools: [{ "googleSearch": {} }],
         generationConfig: {
           responseMimeType: "application/json",
           responseSchema: {
