@@ -37,8 +37,8 @@ import {
   Key
 } from 'lucide-react';
 
-// Setup default empty API key - runtime environment will inject this
-const apiKey = ""; 
+// API key injected at build time via Vercel env var (VITE_GEMINI_API_KEY)
+const apiKey = import.meta.env.VITE_GEMINI_API_KEY || ""; 
 
 // Merchant wallet address where users send their SOL payments
 const MERCHANT_SOL_ADDRESS = "GvD3Z9A4p91L3P7wR4p1kU86X91Z8qVbL6p7qWeR8tY"; 
