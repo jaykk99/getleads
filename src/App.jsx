@@ -37,8 +37,12 @@ import {
   Key
 } from 'lucide-react';
 
-// API key injected at build time via Vercel env var (VITE_GEMINI_API_KEY)
-const apiKey = import.meta.env.VITE_GEMINI_API_KEY || ""; 
+// Gemini API key injected at build time via Vercel env var (VITE_GEMINI_API_KEY).
+// Optional/keyless-first: without it, live AI lead generation is disabled with a
+// clear on-screen message, while the Sample Campaign, campaign manager, CSV
+// export, payment flow, and session recovery keep working.
+const apiKey = import.meta.env.VITE_GEMINI_API_KEY || "";
+const HAS_GEMINI_KEY = apiKey.length > 0;
 
 // Merchant wallet address where users send their SOL payments
 const MERCHANT_SOL_ADDRESS = "GvD3Z9A4p91L3P7wR4p1kU86X91Z8qVbL6p7qWeR8tY"; 
@@ -449,6 +453,16 @@ export default function App() {
 
   // Run lead generation with real search grounding
   const generateLeadsCampaign = async () => {
+    // Keyless-first: refuse early with a clear message instead of a cryptic
+    // API 400 from the backend. Everything else in the app works without a key.
+    if (!HAS_GEMINI_KEY) {
+      setApiError(
+        "Live lead generation needs a Gemini API key. Add VITE_GEMINI_API_KEY to your .env file " +
+        "(see .env.example), rebuild, and redeploy — or load the free Sample Campaign from the sidebar " +
+        "to explore the full dashboard without a key."
+      );
+      return;
+    }
     setLoading(true);
     setApiError(null);
     setLoadingStep(1); 
@@ -743,20 +757,28 @@ export default function App() {
 
   const activeCampaign = campaigns.find(c => c.id === activeCampaignId);
 
-  // Copy helper
-  const handleCopyToClipboard = (text, id) => {
-    const textArea = document.createElement("textarea");
-    textArea.value = text;
-    document.body.appendChild(textArea);
-    textArea.select();
+  // Copy helper — prefers the Clipboard API, falls back to the legacy
+  // execCommand path on non-secure contexts. Only reports success on success.
+  const handleCopyToClipboard = async (text, id) => {
     try {
-      document.execCommand('copy');
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const textArea = document.createElement("textarea");
+        textArea.value = text;
+        textArea.style.position = "fixed";
+        textArea.style.opacity = "0";
+        document.body.appendChild(textArea);
+        textArea.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(textArea);
+        if (!ok) throw new Error("execCommand copy returned false");
+      }
       setCopiedId(id);
       setTimeout(() => setCopiedId(null), 2000);
     } catch (err) {
       console.error('Copy failed', err);
     }
-    document.body.removeChild(textArea);
   };
 
   // Export Leads to CSV
@@ -1456,6 +1478,18 @@ export default function App() {
 
                     </div>
                   </div>
+
+                  {/* Keyless notice: live AI generation needs a key; everything else works */}
+                  {!HAS_GEMINI_KEY && (
+                    <div className="p-4 rounded-xl bg-amber-950/30 border border-amber-500/20 flex items-start space-x-3 text-xs text-amber-200/90 leading-relaxed">
+                      <AlertCircle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
+                      <p>
+                        <strong>No Gemini API key configured</strong> — live lead generation will not run.
+                        Add <code className="font-mono bg-slate-950 px-1.5 py-0.5 rounded">VITE_GEMINI_API_KEY</code> (see
+                        .env.example) and rebuild to enable it. In the meantime, the free Sample Campaign works fully.
+                      </p>
+                    </div>
+                  )}
 
                   {/* Submit Action */}
                   <button
