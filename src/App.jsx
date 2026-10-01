@@ -1,4 +1,11 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
+import {
+  dedupeLeads,
+  validateWizardForm,
+  classifyGeminiError,
+  buildProspectingKit,
+  csvCell,
+} from './lib/leads.js';
 import { 
   Briefcase, 
   Globe, 
@@ -34,7 +41,11 @@ import {
   ShieldAlert,
   Lock,
   Unlock,
-  Key
+  Key,
+  Menu,
+  BookmarkPlus,
+  Filter,
+  History
 } from 'lucide-react';
 
 // Gemini API key injected at build time via Vercel env var (VITE_GEMINI_API_KEY).
@@ -59,6 +70,15 @@ export default function App() {
   const [selectedLead, setSelectedLead] = useState(null);
   const [outreachType, setOutreachType] = useState('email_warm');
   const [showAccountModal, setShowAccountModal] = useState(false);
+
+  // Saved searches, wizard validation, dashboard filtering
+  const [savedSearches, setSavedSearches] = useState([]);
+  const [formErrors, setFormErrors] = useState({});
+  const [searchName, setSearchName] = useState('');
+  const [leadFilter, setLeadFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [sortBy, setSortBy] = useState('warmth');
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   
   // Anti-Abuse and Claim Tracking States
   const [sessionToken, setSessionToken] = useState('');
@@ -176,6 +196,17 @@ export default function App() {
         console.error("Failed to load user profile", e);
       }
     }
+
+    // Load saved searches (wizard presets)
+    const savedSearchesRaw = localStorage.getItem('get_leads_saved_searches');
+    if (savedSearchesRaw) {
+      try {
+        const parsed = JSON.parse(savedSearchesRaw);
+        if (Array.isArray(parsed)) setSavedSearches(parsed);
+      } catch (e) {
+        console.error("Failed to load saved searches", e);
+      }
+    }
   }, []);
 
   // Save campaigns to local storage
@@ -188,6 +219,56 @@ export default function App() {
   const saveProfile = (updatedProfile) => {
     setUserProfile(updatedProfile);
     localStorage.setItem('get_leads_user_profile', JSON.stringify(updatedProfile));
+  };
+
+  // Saved searches: reusable wizard presets (name + form parameters)
+  const persistSavedSearches = (list) => {
+    setSavedSearches(list);
+    localStorage.setItem('get_leads_saved_searches', JSON.stringify(list));
+  };
+
+  const handleSaveSearch = () => {
+    const name = (searchName || '').trim()
+      || `${(formData.targetIndustry || 'Search').trim()} — ${(formData.targetLocation || 'anywhere').trim()}`;
+    const entry = {
+      id: 'search_' + Date.now(),
+      name: name.slice(0, 80),
+      createdAt: new Date().toLocaleDateString(),
+      params: { ...formData },
+    };
+    persistSavedSearches([entry, ...savedSearches].slice(0, 25));
+    setSearchName('');
+  };
+
+  const handleLoadSearch = (entry) => {
+    setFormData({ ...entry.params });
+    setSearchName(entry.name);
+    setFormErrors({});
+  };
+
+  const handleDeleteSearch = (id, e) => {
+    if (e) e.stopPropagation();
+    persistSavedSearches(savedSearches.filter((s) => s.id !== id));
+  };
+
+  // Keyless manual prospecting kit: a CSV of ready-made Google search queries
+  // built from the campaign form. Works fully offline of any API key.
+  const handleDownloadProspectingKit = () => {
+    const rows = buildProspectingKit(formData);
+    const lines = [['Purpose', 'Google Search Query', 'Direct Link'].map(csvCell).join(',')];
+    rows.forEach((r) => {
+      lines.push([r.purpose, r.query, r.url].map(csvCell).join(','));
+    });
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const slug = (formData.targetIndustry || 'leads').toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 40);
+    a.download = `prospecting_kit_${slug || 'leads'}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
   };
 
   // Helper function for exponential backoff API calls
@@ -214,6 +295,9 @@ export default function App() {
         const errorText = await response.text();
         throw new Error(`API error (${response.status}): ${errorText}`);
       } catch (error) {
+        // Client errors (bad key, bad request, forbidden) will never succeed
+        // on retry — fail fast so the user gets the real message immediately.
+        if (/API error \((400|401|403)\)/.test(error.message)) throw error;
         if (i === retries - 1) throw error;
         await new Promise(res => setTimeout(res, delay * Math.pow(2, i)));
       }
@@ -240,6 +324,13 @@ export default function App() {
     }
 
     const cleanSignature = paymentSignature.trim();
+
+    // Basic format check: Solana tx signatures are base58, 87-88 chars.
+    // Catches pasted wallet addresses / truncated hashes before hitting the RPC.
+    if (!/^[1-9A-HJ-NP-Za-km-z]{87,88}$/.test(cleanSignature)) {
+      setPaymentStatusMessage("That doesn't look like a Solana transaction signature (base58, 87–88 characters). Copy the full signature from your wallet or Solana Explorer and try again.");
+      return;
+    }
 
     // ANTI-ABUSE GUARD: Check if signature has already been claimed by another session
     if (claimedSignatures[cleanSignature] && claimedSignatures[cleanSignature] !== sessionToken) {
@@ -469,22 +560,25 @@ export default function App() {
 
     try {
       // Step 1: Analyze target company parameters
+      // Keep the analysis tight and factual: prefer the provided website via
+      // search grounding, fall back to the description, never invent details.
       const analysisPrompt = `
-        You are an elite B2B growth agency system. 
-        Analyze the following business to extract what they sell, their unique selling proposition (USP), and define their ideal target audience:
+        You are an elite B2B growth agency system.
+        Analyze the following business and return ONLY verified or clearly-labeled facts.
         - Business Name: ${formData.businessName || userProfile.senderCompany}
         - Website: ${formData.website || 'None provided'}
         - Description: ${formData.description || 'None provided'}
 
-        If a website is provided, use google_search to look up "${formData.businessName || userProfile.senderCompany} ${formData.website}" to grab actual details about their products/services.
-        
+        ${formData.website ? `Use google_search to look up "${formData.businessName || userProfile.senderCompany} ${formData.website}" and base your analysis on what you actually find.` : `No website was provided. Work only from the description above; if the description is empty, say so plainly instead of inventing one.`}
+
         Return a structured JSON with these exact keys:
         {
-          "companyDescription": "Clear description of what the company does",
-          "coreOffer": "The primary product/service they sell",
-          "valueProposition": "Why customers choose them",
+          "companyDescription": "One clear sentence about what the company does (mark as 'Not specified' if unknown)",
+          "coreOffer": "The primary product/service they sell, as stated or clearly inferred",
+          "valueProposition": "Why customers choose them, in one sentence",
           "suggestedTargetSectors": ["Sector 1", "Sector 2", "Sector 3"]
         }
+        The suggestedTargetSectors must be real industries that plausibly buy the core offer.
       `;
 
       let businessAnalysis = {
@@ -530,28 +624,36 @@ export default function App() {
       const leadQty = parseInt(selectedLeadTier) || 15;
 
       const leadSearchPrompt = `
-        You are an elite web scraper and B2B pipeline builder.
-        We need real B2B target leads for our company: "${formData.businessName || userProfile.senderCompany}".
+        You are an elite B2B pipeline builder working ONLY from live Google search results.
+        Build a prospect list for our company: "${formData.businessName || userProfile.senderCompany}".
         Our business profile:
         - Description: ${businessAnalysis.companyDescription}
         - Core Offer: ${businessAnalysis.coreOffer}
         - Value Proposition: ${businessAnalysis.valueProposition}
 
-        Using live Google search grounding, find real active businesses, agencies, local organizations, or target profiles in "${searchNiche}" operating in "${searchLoc}" that would benefit from our core offer.
-        Do NOT generate fake names or domains. Search the live index to extract actual business entities.
-        
-        Generate a list of exactly ${leadQty} real target leads with the most accurate publicly accessible data.
-        For each lead, discover:
+        Using google_search grounding, find real, currently-active businesses in "${searchNiche}" operating in "${searchLoc}" that would plausibly benefit from our core offer.
+
+        STRICT RULES:
+        - NEVER invent a company, person, email, or phone number. Every row must come from an actual search result.
+        - If you cannot verify ${leadQty} distinct real companies, return FEWER rows — a short honest list beats a padded fake one.
+        - Each company may appear only once (no duplicate companies or duplicate domains).
+        - The website field must be the company's real domain, matching the company name (e.g. company "Acme Dental" -> website on acmedental.com).
+        - Contact emails must be real patterns you found or clearly-standard formats like info@domain.com / contact@domain.com; never invent a personal name + invented inbox and present it as verified.
+        - Phone numbers: only include if found in the source; otherwise use "".
+        - warmthScore (1-100): score ONLY on observable fit between the prospect's public profile and our core offer; 85+ means obvious current need, 60-84 moderate fit, below 60 weak fit. Explain the score in leadReason.
+        - sourcedFromUrl must be the actual search-result URL where the business was verified.
+
+        For each verified lead provide:
         1. Company Name
-        2. Website (The real active URL or verified domain, e.g. "https://www.activebusiness.com")
-        3. Target Decision Maker Name (Find actual publicly-listed executive/founder names or generate a highly accurate localized representation of a ${formData.targetRole})
-        4. Target Decision Maker Title (e.g. Managing Director, CMO, VP)
-        5. Contact Email (The real contact/support/business email or standard B2B pattern like contact@domain.com or hello@domain.com)
-        6. Phone number (formatted realistically)
-        7. Warmth Score (1-100, based on how badly they need our core offer)
-        8. Lead Reason (A direct explanation of why this specific company needs our core offer right now)
-        9. Custom Outreach Hook (A hyper-personalized icebreaker referencing their specific business niche or real public announcements)
-        10. SourcedFromUrl (The real website/directory URL where this lead or business is verified on the web)
+        2. Website (real active URL)
+        3. Target Decision Maker Name (publicly-listed founder/executive only; use "" if none is publicly listed)
+        4. Target Decision Maker Title
+        5. Contact Email
+        6. Phone number ("" if not found)
+        7. Warmth Score (1-100, per the rules above)
+        8. Lead Reason (why THIS company needs our core offer now, referencing something real you found)
+        9. Custom Outreach Hook (hyper-personalized icebreaker referencing their niche or a real public fact)
+        10. SourcedFromUrl (the verifying search-result URL)
 
         Return a structured JSON with this exact key: "leads" which contains an array of lead objects.
       `;
@@ -602,6 +704,33 @@ export default function App() {
         const parsedLeads = JSON.parse(leadText);
         leadsList = parsedLeads.leads || [];
       } else {
+        throw new Error("No leads returned from the generator API.");
+      }
+
+      // Sanitize + deduplicate: drop empty rows, normalize fields, clamp
+      // scores, and remove duplicate companies/domains before saving.
+      const sanitized = leadsList
+        .filter((l) => l && (l.companyName || '').trim())
+        .map((l) => ({
+          ...l,
+          companyName: (l.companyName || '').trim(),
+          website: (l.website || '').trim(),
+          contactName: (l.contactName || '').trim(),
+          contactTitle: (l.contactTitle || '').trim(),
+          email: (l.email || '').trim(),
+          phone: (l.phone || '').trim(),
+          warmthScore: Math.max(1, Math.min(100, Math.round(Number(l.warmthScore) || 50))),
+          leadReason: (l.leadReason || '').trim(),
+          customHook: (l.customHook || '').trim(),
+          sourcedFromUrl: (l.sourcedFromUrl || '').trim(),
+        }));
+      const { leads: uniqueLeads, removed } = dedupeLeads(sanitized);
+      if (removed > 0) {
+        console.info(`[getleads] Removed ${removed} duplicate lead row(s) before saving.`);
+      }
+      leadsList = uniqueLeads;
+
+      if (leadsList.length === 0) {
         throw new Error("No leads returned from the generator API.");
       }
 
@@ -699,7 +828,7 @@ export default function App() {
 
     } catch (error) {
       console.error(error);
-      setApiError(error.message || "An unexpected error occurred during API lookup.");
+      setApiError(classifyGeminiError(error.message));
     } finally {
       setLoading(false);
       setLoadingStep(0);
@@ -709,6 +838,7 @@ export default function App() {
   // Switch Campaigns
   const handleSelectCampaign = (id) => {
     setActiveCampaignId(id);
+    setSidebarOpen(false); // collapse mobile campaigns drawer
     const camp = campaigns.find(c => c.id === id);
     if (camp && camp.leads.length > 0) {
       setSelectedLead(camp.leads[0]);
@@ -757,6 +887,34 @@ export default function App() {
 
   const activeCampaign = campaigns.find(c => c.id === activeCampaignId);
 
+  // Dashboard: searchable, filterable, sortable view of the active leads list
+  const filteredLeads = useMemo(() => {
+    if (!activeCampaign) return [];
+    let list = [...activeCampaign.leads];
+    if (statusFilter !== 'all') {
+      list = list.filter((l) => (l.status || 'New') === statusFilter);
+    }
+    const q = leadFilter.trim().toLowerCase();
+    if (q) {
+      list = list.filter((l) =>
+        [l.companyName, l.contactName, l.contactTitle, l.email, l.website]
+          .some((v) => (v || '').toLowerCase().includes(q))
+      );
+    }
+    switch (sortBy) {
+      case 'company':
+        list.sort((a, b) => (a.companyName || '').localeCompare(b.companyName || ''));
+        break;
+      case 'status':
+        list.sort((a, b) => (a.status || '').localeCompare(b.status || ''));
+        break;
+      case 'warmth':
+      default:
+        list.sort((a, b) => (Number(b.warmthScore) || 0) - (Number(a.warmthScore) || 0));
+    }
+    return list;
+  }, [activeCampaign, leadFilter, statusFilter, sortBy]);
+
   // Copy helper — prefers the Clipboard API, falls back to the legacy
   // execCommand path on non-secure contexts. Only reports success on success.
   const handleCopyToClipboard = async (text, id) => {
@@ -781,34 +939,34 @@ export default function App() {
     }
   };
 
-  // Export Leads to CSV
+  // Export Leads to CSV (Blob download — safe for large 10k-lead campaigns)
   const handleExportCSV = () => {
     if (!activeCampaign || !activeCampaign.leads.length) return;
-    
+
     const headers = ["Company Name", "Website", "Decision Maker", "Title", "Email", "Phone", "Warmth Score", "Lead Match Reason", "Sourced From URL", "Status"];
     const rows = activeCampaign.leads.map(l => [
-      `"${l.companyName.replace(/"/g, '""')}"`,
-      `"${l.website.replace(/"/g, '""')}"`,
-      `"${l.contactName.replace(/"/g, '""')}"`,
-      `"${l.contactTitle.replace(/"/g, '""')}"`,
-      `"${l.email.replace(/"/g, '""')}"`,
-      `"${l.phone.replace(/"/g, '""')}"`,
+      l.companyName,
+      l.website,
+      l.contactName,
+      l.contactTitle,
+      l.email,
+      l.phone,
       l.warmthScore,
-      `"${l.leadReason.replace(/"/g, '""')}"`,
-      `"${(l.sourcedFromUrl || '').replace(/"/g, '""')}"`,
+      l.leadReason,
+      (l.sourcedFromUrl || ''),
       l.status
-    ]);
+    ].map(csvCell).join(","));
 
-    const csvContent = "data:text/csv;charset=utf-8," 
-      + [headers.join(","), ...rows.map(e => e.join(","))].join("\n");
-    
-    const encodedUri = encodeURI(csvContent);
+    const csvContent = [headers.map(csvCell).join(","), ...rows].join("\n");
+    const blob = new Blob(["\uFEFF" + csvContent], { type: "text/csv;charset=utf-8" }); // BOM for Excel
+    const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
-    link.setAttribute("download", `get_leads_grounded_${activeCampaign.businessInfo.name.toLowerCase().replace(/\s+/g, '_')}.csv`);
+    link.setAttribute("href", url);
+    link.setAttribute("download", `get_leads_${activeCampaign.businessInfo.name.toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 40) || 'campaign'}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
   };
 
   // Compile outreach pitch replacing placeholders with active lead data
@@ -889,6 +1047,30 @@ export default function App() {
         </div>
 
         <div className="flex items-center space-x-3">
+          {/* Mobile campaigns drawer toggle */}
+          <button
+            onClick={() => setSidebarOpen(!sidebarOpen)}
+            className="md:hidden flex items-center justify-center w-9 h-9 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-200 transition-all active:scale-95"
+            title="Toggle campaigns panel"
+          >
+            <Menu className="h-4 w-4" />
+          </button>
+
+          {/* Honest key status: shows at a glance whether AI generation is live */}
+          <span
+            title={HAS_GEMINI_KEY
+              ? "Gemini API key detected — live AI lead generation enabled"
+              : "No Gemini API key — live generation disabled, keyless features still work"}
+            className={`hidden sm:inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider border ${
+              HAS_GEMINI_KEY
+                ? 'bg-emerald-500/10 border-emerald-500/25 text-emerald-400'
+                : 'bg-amber-500/10 border-amber-500/25 text-amber-400'
+            }`}
+          >
+            <span className={`h-1.5 w-1.5 rounded-full ${HAS_GEMINI_KEY ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'}`} />
+            <span>{HAS_GEMINI_KEY ? 'AI Live' : 'Keyless'}</span>
+          </span>
+
           {/* Account Settings Trigger */}
           <button
             onClick={() => setShowAccountModal(true)}
@@ -1082,7 +1264,7 @@ export default function App() {
       <div className="flex-1 flex flex-col md:flex-row h-[calc(100vh-73px)] overflow-hidden">
         
         {/* Left Sidebar - Campaign Lists */}
-        <aside className="w-full md:w-80 border-r border-slate-800/80 bg-slate-900/40 p-4 flex flex-col space-y-4 overflow-y-auto shrink-0 justify-between">
+        <aside className={`${sidebarOpen ? 'flex' : 'hidden'} md:flex w-full md:w-80 border-r border-slate-800/80 bg-slate-900/40 p-4 flex-col space-y-4 overflow-y-auto shrink-0 justify-between absolute md:static inset-x-0 top-[73px] bottom-0 z-30`}>
           <div className="space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">Campaigns</h3>
@@ -1179,10 +1361,29 @@ export default function App() {
                   <h3 className="text-2xl font-bold bg-gradient-to-r from-amber-400 to-indigo-500 bg-clip-text text-transparent">
                     Extracting Grounded Leads...
                   </h3>
-                  <p className="text-sm text-slate-400">
+                  <p className="text-sm text-slate-400 min-h-[2.5rem]">
                     {loadingStep === 1 && "🌐 Running live index scans of your provided business parameters..."}
                     {loadingStep === 2 && "🔍 Interrogating active Web Directories and search results for real prospects..."}
                     {loadingStep === 3 && "✍️ Custom-tailoring high converting outbound outreach scripts..."}
+                  </p>
+
+                  {/* Step progress */}
+                  <div className="flex items-center justify-center space-x-2">
+                    {[1, 2, 3].map((step) => (
+                      <div key={step} className="flex items-center space-x-2">
+                        <div className={`h-2.5 w-2.5 rounded-full transition-all ${
+                          loadingStep > step
+                            ? 'bg-emerald-400'
+                            : loadingStep === step
+                            ? 'bg-indigo-400 animate-pulse'
+                            : 'bg-slate-700'
+                        }`} />
+                        {step < 3 && <div className="h-px w-8 bg-slate-800" />}
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-[11px] text-slate-500 font-mono">
+                    Step {loadingStep} of 3 · duplicates removed automatically · campaigns saved locally
                   </p>
                 </div>
               </div>
@@ -1357,7 +1558,11 @@ export default function App() {
                 <form 
                   onSubmit={(e) => {
                     e.preventDefault();
-                    setViewMode('payment');
+                    const errors = validateWizardForm(formData);
+                    setFormErrors(errors);
+                    if (Object.keys(errors).length === 0) {
+                      setViewMode('payment');
+                    }
                   }} 
                   className="space-y-6"
                 >
@@ -1376,12 +1581,14 @@ export default function App() {
                         <label className="block text-xs font-semibold text-slate-300 mb-1.5">Company/Brand Name *</label>
                         <input 
                           type="text" 
-                          required
                           placeholder="e.g. Acme Web Agency" 
                           value={formData.businessName}
                           onChange={(e) => setFormData({ ...formData, businessName: e.target.value })}
-                          className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 transition-colors placeholder:text-slate-600"
+                          className={`w-full bg-slate-950 border rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none transition-colors placeholder:text-slate-600 ${formErrors.businessName ? 'border-red-500/60 focus:border-red-500' : 'border-slate-800 focus:border-indigo-500'}`}
                         />
+                        {formErrors.businessName && (
+                          <p className="text-xs text-red-400 mt-1">{formErrors.businessName}</p>
+                        )}
                       </div>
 
                       {/* Website */}
@@ -1394,9 +1601,12 @@ export default function App() {
                             placeholder="e.g. https://myacmewebsite.com" 
                             value={formData.website}
                             onChange={(e) => setFormData({ ...formData, website: e.target.value })}
-                            className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-10 pr-4 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 transition-colors placeholder:text-slate-600"
+                            className={`w-full bg-slate-950 border rounded-xl pl-10 pr-4 py-2.5 text-sm text-slate-200 focus:outline-none transition-colors placeholder:text-slate-600 ${formErrors.website ? 'border-red-500/60 focus:border-red-500' : 'border-slate-800 focus:border-indigo-500'}`}
                         />
                         </div>
+                        {formErrors.website && (
+                          <p className="text-xs text-red-400 -mt-2">{formErrors.website}</p>
+                        )}
                       </div>
 
                       {/* Description */}
@@ -1407,8 +1617,11 @@ export default function App() {
                           placeholder="Provide a short description or list of services so the AI knows exactly what leads are the best fit..." 
                           value={formData.description}
                           onChange={(e) => setFormData({ ...formData, description: e.target.value })}
-                          className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 transition-colors placeholder:text-slate-600 resize-none"
+                          className={`w-full bg-slate-950 border rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none transition-colors placeholder:text-slate-600 resize-none ${formErrors.description ? 'border-red-500/60 focus:border-red-500' : 'border-slate-800 focus:border-indigo-500'}`}
                         />
+                        {formErrors.description && (
+                          <p className="text-xs text-red-400 mt-1">{formErrors.description}</p>
+                        )}
                       </div>
 
                     </div>
@@ -1428,12 +1641,14 @@ export default function App() {
                         <label className="block text-xs font-semibold text-slate-300 mb-1.5">Target Industry/Niche *</label>
                         <input 
                           type="text" 
-                          required
                           placeholder="e.g. Real Estate Agencies, SaaS Startups, Dental Clinics" 
                           value={formData.targetIndustry}
                           onChange={(e) => setFormData({ ...formData, targetIndustry: e.target.value })}
-                          className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 transition-colors placeholder:text-slate-600"
+                          className={`w-full bg-slate-950 border rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none transition-colors placeholder:text-slate-600 ${formErrors.targetIndustry ? 'border-red-500/60 focus:border-red-500' : 'border-slate-800 focus:border-indigo-500'}`}
                         />
+                        {formErrors.targetIndustry && (
+                          <p className="text-xs text-red-400 mt-1">{formErrors.targetIndustry}</p>
+                        )}
                       </div>
 
                       {/* Target Location */}
@@ -1441,12 +1656,14 @@ export default function App() {
                         <label className="block text-xs font-semibold text-slate-300 mb-1.5">Target Location *</label>
                         <input 
                           type="text" 
-                          required
                           placeholder="e.g. New York, United Kingdom, Texas" 
                           value={formData.targetLocation}
                           onChange={(e) => setFormData({ ...formData, targetLocation: e.target.value })}
-                          className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 transition-colors placeholder:text-slate-600"
+                          className={`w-full bg-slate-950 border rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none transition-colors placeholder:text-slate-600 ${formErrors.targetLocation ? 'border-red-500/60 focus:border-red-500' : 'border-slate-800 focus:border-indigo-500'}`}
                         />
+                        {formErrors.targetLocation && (
+                          <p className="text-xs text-red-400 mt-1">{formErrors.targetLocation}</p>
+                        )}
                       </div>
 
                       {/* Decision Maker Title */}
@@ -1481,15 +1698,92 @@ export default function App() {
 
                   {/* Keyless notice: live AI generation needs a key; everything else works */}
                   {!HAS_GEMINI_KEY && (
-                    <div className="p-4 rounded-xl bg-amber-950/30 border border-amber-500/20 flex items-start space-x-3 text-xs text-amber-200/90 leading-relaxed">
-                      <AlertCircle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
-                      <p>
-                        <strong>No Gemini API key configured</strong> — live lead generation will not run.
-                        Add <code className="font-mono bg-slate-950 px-1.5 py-0.5 rounded">VITE_GEMINI_API_KEY</code> (see
-                        .env.example) and rebuild to enable it. In the meantime, the free Sample Campaign works fully.
+                    <div className="p-4 rounded-xl bg-amber-950/30 border border-amber-500/20 space-y-3">
+                      <div className="flex items-start space-x-3 text-xs text-amber-200/90 leading-relaxed">
+                        <AlertCircle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
+                        <p>
+                          <strong>No Gemini API key configured</strong> — live AI lead generation will not run.
+                          Add <code className="font-mono bg-slate-950 px-1.5 py-0.5 rounded">VITE_GEMINI_API_KEY</code> (see
+                          .env.example) and rebuild to enable it. In the meantime, the free Sample Campaign works fully,
+                          and you can prospect manually with the kit below — no key needed.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleDownloadProspectingKit}
+                        className="flex items-center space-x-2 px-4 py-2.5 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-xs font-bold transition-all active:scale-95"
+                      >
+                        <Download className="h-3.5 w-3.5" />
+                        <span>Download Manual Prospecting Kit (CSV, keyless)</span>
+                      </button>
+                      <p className="text-[11px] text-amber-200/60 leading-relaxed">
+                        Ready-made Google search queries for your niche + location: LinkedIn prospecting, directories,
+                        funding signals, and pain-point searches. Open each link, work the results by hand.
                       </p>
                     </div>
                   )}
+
+                  {/* Saved Searches */}
+                  <div className="bg-slate-900/50 rounded-2xl p-6 border border-slate-800/80 space-y-4">
+                    <h3 className="font-semibold text-xs uppercase tracking-wider text-emerald-400 flex items-center space-x-1.5">
+                      <BookmarkPlus className="h-4 w-4" />
+                      <span>Saved Searches</span>
+                    </h3>
+
+                    <div className="flex flex-col sm:flex-row gap-2.5">
+                      <input
+                        type="text"
+                        placeholder="Name this search (optional — auto-names from niche + location)"
+                        value={searchName}
+                        onChange={(e) => setSearchName(e.target.value)}
+                        className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-emerald-500 transition-colors placeholder:text-slate-600"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleSaveSearch}
+                        className="px-4 py-2.5 rounded-xl bg-emerald-600/15 hover:bg-emerald-600/25 border border-emerald-500/30 text-emerald-300 text-xs font-bold flex items-center justify-center space-x-1.5 transition-all active:scale-95 shrink-0"
+                      >
+                        <BookmarkPlus className="h-3.5 w-3.5" />
+                        <span>Save current</span>
+                      </button>
+                    </div>
+
+                    {savedSearches.length === 0 ? (
+                      <p className="text-xs text-slate-500 leading-relaxed">
+                        No saved searches yet. Configure the form above and save it to reuse this exact
+                        targeting combo in one click later.
+                      </p>
+                    ) : (
+                      <div className="space-y-2">
+                        {savedSearches.map((s) => (
+                          <div
+                            key={s.id}
+                            onClick={() => handleLoadSearch(s)}
+                            className="group flex items-center justify-between gap-3 p-3 rounded-xl bg-slate-950 border border-slate-850 hover:border-emerald-500/30 cursor-pointer transition-all"
+                            title="Load this search into the form"
+                          >
+                            <div className="flex items-center space-x-2.5 min-w-0">
+                              <History className="h-4 w-4 text-emerald-400 shrink-0" />
+                              <div className="min-w-0">
+                                <p className="text-xs font-semibold text-slate-200 truncate">{s.name}</p>
+                                <p className="text-[10px] text-slate-500 truncate">
+                                  {s.params.targetIndustry || '—'} · {s.params.targetLocation || '—'} · {s.createdAt}
+                                </p>
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={(e) => handleDeleteSearch(s.id, e)}
+                              className="p-1.5 rounded-lg text-slate-600 hover:text-red-400 hover:bg-red-500/10 transition-all shrink-0"
+                              title="Delete saved search"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
 
                   {/* Submit Action */}
                   <button
@@ -1693,16 +1987,95 @@ export default function App() {
                   
                   {/* Leads Board List Panel */}
                   <div className="flex-1 overflow-y-auto border-r border-slate-800/80">
-                    <div className="px-6 py-4 bg-slate-900/10 border-b border-slate-800/40 sticky top-0 backdrop-blur z-10 flex items-center justify-between">
-                      <span className="text-xs font-bold uppercase tracking-wider text-slate-400">Grounded Contacts List</span>
-                      <span className="text-xs text-slate-500 flex items-center space-x-1.5 font-semibold">
-                        <UserCheck className="h-3.5 w-3.5 text-indigo-400" />
-                        <span>Customized for {userProfile.senderName}</span>
-                      </span>
+                    <div className="px-6 py-4 bg-slate-900/10 border-b border-slate-800/40 sticky top-0 backdrop-blur z-10 space-y-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                          Grounded Contacts List
+                          <span className="ml-2 text-slate-500 font-semibold normal-case tracking-normal">
+                            {filteredLeads.length} of {activeCampaign.leads.length} shown
+                          </span>
+                        </span>
+                        <span className="text-xs text-slate-500 hidden sm:flex items-center space-x-1.5 font-semibold">
+                          <UserCheck className="h-3.5 w-3.5 text-indigo-400" />
+                          <span>Customized for {userProfile.senderName}</span>
+                        </span>
+                      </div>
+
+                      {/* Search / filter / sort toolbar */}
+                      <div className="flex flex-col sm:flex-row gap-2.5">
+                        <div className="relative flex-1">
+                          <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-500" />
+                          <input
+                            type="text"
+                            placeholder="Search company, contact, email, or domain..."
+                            value={leadFilter}
+                            onChange={(e) => setLeadFilter(e.target.value)}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-9 pr-8 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 transition-colors placeholder:text-slate-600"
+                          />
+                          {leadFilter && (
+                            <button
+                              onClick={() => setLeadFilter('')}
+                              className="absolute right-2.5 top-2.5 text-slate-500 hover:text-slate-300"
+                              title="Clear search"
+                            >
+                              <X className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                        </div>
+                        <div className="flex gap-2.5">
+                          <div className="relative">
+                            <Filter className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-500 pointer-events-none" />
+                            <select
+                              value={statusFilter}
+                              onChange={(e) => setStatusFilter(e.target.value)}
+                              className="bg-slate-950 border border-slate-800 rounded-xl pl-8 pr-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 appearance-none"
+                              title="Filter by status"
+                            >
+                              <option value="all">All statuses</option>
+                              <option value="New">New</option>
+                              <option value="Contacted">Contacted</option>
+                              <option value="In-Progress">In-Progress</option>
+                              <option value="Converted">Converted</option>
+                              <option value="Unqualified">Unqualified</option>
+                            </select>
+                          </div>
+                          <select
+                            value={sortBy}
+                            onChange={(e) => setSortBy(e.target.value)}
+                            className="bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 appearance-none"
+                            title="Sort leads"
+                          >
+                            <option value="warmth">Sort: Warmth ↓</option>
+                            <option value="company">Sort: Company A–Z</option>
+                            <option value="status">Sort: Status</option>
+                          </select>
+                        </div>
+                      </div>
                     </div>
 
                     <div className="divide-y divide-slate-800/80">
-                      {activeCampaign.leads.map((lead) => {
+                      {filteredLeads.length === 0 && (
+                        <div className="p-10 text-center space-y-3">
+                          <Search className="h-10 w-10 text-slate-700 mx-auto" />
+                          <p className="text-sm text-slate-400 font-semibold">
+                            {activeCampaign.leads.length === 0 ? 'No leads in this campaign yet.' : 'No leads match your filters.'}
+                          </p>
+                          <p className="text-xs text-slate-500">
+                            {activeCampaign.leads.length === 0
+                              ? 'Run a new campaign from the wizard to source leads.'
+                              : 'Try clearing the search or choosing a different status filter.'}
+                          </p>
+                          {(leadFilter || statusFilter !== 'all') && (
+                            <button
+                              onClick={() => { setLeadFilter(''); setStatusFilter('all'); }}
+                              className="mt-2 px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 border border-slate-700 transition-all"
+                            >
+                              Clear filters
+                            </button>
+                          )}
+                        </div>
+                      )}
+                      {filteredLeads.map((lead) => {
                         const isSelected = selectedLead && selectedLead.id === lead.id;
                         return (
                           <div 
@@ -1745,13 +2118,15 @@ export default function App() {
                             </div>
 
                             <div className="flex items-center md:flex-col items-end gap-3 justify-between">
-                              {/* Warmth indicator */}
-                              <div className="flex items-center space-x-1">
+                              {/* Warmth indicator: hot / warm / cold tiers */}
+                              <div className="flex items-center space-x-1" title={`Fit score ${lead.warmthScore}/100 — ${lead.warmthScore >= 85 ? 'Hot: obvious current need' : lead.warmthScore >= 65 ? 'Warm: solid fit' : 'Cold: weak fit'}`}>
                                 <span className="text-xs font-semibold text-slate-400">Fit:</span>
                                 <span className={`text-xs font-bold px-1.5 py-0.5 rounded ${
-                                  lead.warmthScore >= 85 
-                                    ? 'bg-red-500/10 text-red-400 border border-red-500/20' 
-                                    : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+                                  lead.warmthScore >= 85
+                                    ? 'bg-red-500/10 text-red-400 border border-red-500/20'
+                                    : lead.warmthScore >= 65
+                                    ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+                                    : 'bg-slate-500/10 text-slate-400 border border-slate-500/20'
                                 }`}>
                                   {lead.warmthScore}%
                                 </span>

@@ -2,6 +2,24 @@
 
 Solana Web3-gated B2B lead sourcing app. Describe a business, verify a SOL payment on-chain, and source matching B2B leads with personalized outreach templates — all powered by live search grounding.
 
+## Features
+
+- **Campaign wizard** with inline validation (business name, niche, location required;
+  website must be a full http(s) URL) — no more cryptic failures from bad input.
+- **Saved searches** — save any wizard configuration and reload it in one click
+  (stored in `localStorage`, up to 25).
+- **Lead dashboard** — search across company/contact/email/domain, filter by status,
+  sort by warmth / company / status; 3-tier warmth badges (hot ≥ 85, warm ≥ 65, cold).
+- **Automatic deduplication** — duplicate companies/domains are removed before a
+  campaign is saved (see `src/lib/leads.js`).
+- **CSV export** via Blob download (Excel-friendly BOM) — safe for 10k-lead campaigns.
+- **Keyless mode** — header badge shows `Keyless` vs `AI Live` at a glance; without a
+  key you still get the Sample Campaign, campaign manager, and a downloadable
+  **Manual Prospecting Kit** (ready-made Google search queries for your niche/location).
+- **Honest error states** — Gemini failures are classified (invalid key, rate limit,
+  permission denied, network, bad response) into plain-language messages; client
+  errors (400/401/403) fail fast instead of retrying five times.
+
 ## Stack
 
 - React 18 + Vite
@@ -51,4 +69,13 @@ history for a qualifying merchant payment and re-binds it to the new session.
 ```bash
 npm install
 npm run build   # outputs dist/
+```
+
+## Tests
+
+Pure logic (dedupe, validation, error classification, prospecting kit, CSV helpers)
+lives in `src/lib/leads.js` and is covered by a node assertion suite:
+
+```bash
+npm test   # runs scripts/test-helpers.mjs
 ```
