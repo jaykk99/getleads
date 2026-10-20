@@ -1,5 +1,8 @@
 # GET LEADS
 
+Live: https://project-d3cxp.vercel.app (currently returns 402 — the Vercel
+team is paused; the code builds and runs clean locally)
+
 Solana Web3-gated B2B lead sourcing app. Describe a business, verify a SOL payment on-chain, and source matching B2B leads with personalized outreach templates — all powered by live search grounding.
 
 ## Features
