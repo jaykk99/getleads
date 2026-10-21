@@ -17,6 +17,7 @@ import {
   importLeadsFromCSV,
   scoreLeadCompleteness,
   campaignDataQuality,
+  findCrossCampaignDuplicates,
 } from "../src/lib/leads.js";
 
 // normalizeDomain
@@ -192,5 +193,39 @@ assert.equal(
   ]),
   58
 );
+
+// findCrossCampaignDuplicates
+{
+  const camps = [
+    {
+      id: "c1",
+      businessInfo: { name: "Dentists" },
+      leads: [
+        { companyName: "Acme Dental", website: "https://acme.com" },
+        { companyName: "Solo Row", website: "" },
+      ],
+    },
+    {
+      id: "c2",
+      businessInfo: { name: "Roofers" },
+      leads: [
+        { companyName: "Acme Dental LLC", website: "https://www.acme.com/" },
+        { companyName: "Beta Roofing", website: "" },
+      ],
+    },
+    {
+      id: "c3",
+      businessInfo: { name: "Plumbers" },
+      leads: [{ companyName: "Gamma Plumbing", website: "" }],
+    },
+  ];
+  const dupes = findCrossCampaignDuplicates(camps);
+  assert.equal(dupes.length, 1);
+  assert.equal(dupes[0].entries.length, 2);
+  assert.ok(dupes[0].entries.some((e) => e.campaignName === "Dentists"));
+  assert.ok(dupes[0].entries.some((e) => e.campaignName === "Roofers"));
+  // unnamed leads never form groups
+  assert.equal(findCrossCampaignDuplicates([]).length, 0);
+}
 
 console.log("All helper tests passed.");

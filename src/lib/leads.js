@@ -513,3 +513,33 @@ export function campaignDataQuality(leads) {
   const total = leads.reduce((acc, l) => acc + scoreLeadCompleteness(l).score, 0);
   return Math.round(total / leads.length);
 }
+
+/**
+ * Find the same lead (identity key) appearing in more than one campaign.
+ * Useful when the same niche/location is sourced twice.
+ *
+ * Returns an array of { key, entries: [{ campaignId, campaignName, lead }] },
+ * one entry per duplicated identity, sorted by group size descending.
+ */
+export function findCrossCampaignDuplicates(campaigns) {
+  const byKey = new Map();
+  for (const camp of campaigns || []) {
+    for (const lead of camp.leads || []) {
+      const key = leadKey(lead);
+      if (!key || key === "n:") continue;
+      if (!byKey.has(key)) byKey.set(key, []);
+      byKey.get(key).push({
+        campaignId: camp.id,
+        campaignName: camp.businessInfo?.name || "Untitled",
+        lead,
+      });
+    }
+  }
+  const dupes = [];
+  for (const [key, entries] of byKey) {
+    const campaignIds = new Set(entries.map((e) => e.campaignId));
+    if (campaignIds.size > 1) dupes.push({ key, entries });
+  }
+  dupes.sort((a, b) => b.entries.length - a.entries.length);
+  return dupes;
+}

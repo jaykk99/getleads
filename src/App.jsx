@@ -10,6 +10,7 @@ import {
   importLeadsFromCSV,
   scoreLeadCompleteness,
   campaignDataQuality,
+  findCrossCampaignDuplicates,
 } from './lib/leads.js';
 import { 
   Briefcase, 
@@ -94,6 +95,15 @@ export default function App() {
   // Batch lead selection (dashboard)
   const [selectedLeadIds, setSelectedLeadIds] = useState([]);
   const [batchStatus, setBatchStatus] = useState('');
+
+  // Cross-campaign duplicate scan report
+  const [showDupesModal, setShowDupesModal] = useState(false);
+  const [dupeReport, setDupeReport] = useState(null);
+
+  const handleScanDuplicates = () => {
+    setDupeReport(findCrossCampaignDuplicates(campaigns));
+    setShowDupesModal(true);
+  };
   
   // Anti-Abuse and Claim Tracking States
   const [sessionToken, setSessionToken] = useState('');
@@ -1360,6 +1370,75 @@ export default function App() {
         </div>
       )}
 
+      {/* Cross-campaign duplicate report modal */}
+      {showDupesModal && (
+        <div className="fixed inset-0 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl p-6 relative shadow-2xl flex flex-col max-h-[85vh]">
+            <button
+              onClick={() => setShowDupesModal(false)}
+              className="absolute right-4 top-4 text-slate-400 hover:text-slate-200 transition-colors"
+            >
+              <X className="h-5 w-5" />
+            </button>
+            <div className="flex items-center space-x-2 border-b border-slate-800 pb-3 mb-4">
+              <Search className="h-5 w-5 text-amber-400" />
+              <h3 className="font-bold text-lg text-slate-100">Duplicate Leads Across Campaigns</h3>
+            </div>
+            {!dupeReport || dupeReport.length === 0 ? (
+              <div className="text-center py-10 space-y-3">
+                <CheckCircle className="h-10 w-10 text-emerald-400 mx-auto" />
+                <p className="text-sm text-slate-300 font-semibold">No cross-campaign duplicates found.</p>
+                <p className="text-xs text-slate-500">Every lead appears in exactly one campaign.</p>
+              </div>
+            ) : (
+              <>
+                <p className="text-xs text-slate-400 mb-3">
+                  <strong className="text-amber-300">{dupeReport.length}</strong> lead{dupeReport.length > 1 ? 's' : ''} appear{dupeReport.length > 1 ? '' : 's'} in more than one campaign. Nothing was changed — review and clean up manually if you want one canonical copy.
+                </p>
+                <div className="overflow-y-auto space-y-2.5 pr-1">
+                  {dupeReport.map((group, gi) => (
+                    <div key={gi} className="p-3.5 rounded-xl bg-slate-950 border border-amber-500/15">
+                      <p className="text-xs font-bold text-slate-200 mb-2">
+                        {group.entries[0].lead.companyName}
+                        <span className="ml-2 text-[10px] font-semibold text-slate-500">in {group.entries.length} campaigns</span>
+                      </p>
+                      <div className="space-y-1.5">
+                        {group.entries.map((e, i) => (
+                          <div key={i} className="flex items-center justify-between gap-2 text-[11px]">
+                            <span className="text-slate-400 truncate">
+                              <span className="text-slate-200 font-semibold">{e.campaignName}</span>
+                              {e.lead.website && <span className="text-slate-500 font-mono"> · {e.lead.website}</span>}
+                              <span className="text-slate-500"> · status: {e.lead.status || 'New'}</span>
+                            </span>
+                            <button
+                              onClick={() => {
+                                setShowDupesModal(false);
+                                handleSelectCampaign(e.campaignId);
+                              }}
+                              className="shrink-0 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-indigo-300 text-[10px] font-bold transition-all"
+                            >
+                              Open campaign
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+            <div className="flex justify-end pt-4 mt-3 border-t border-slate-800">
+              <button
+                onClick={() => setShowDupesModal(false)}
+                className="px-5 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-xl transition-all"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* CSV Import Modal */}
       {showImportModal && (
         <div className="fixed inset-0 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center z-50 p-4">
@@ -1575,6 +1654,17 @@ export default function App() {
                 {campaigns.length} Active
               </span>
             </div>
+
+            {campaigns.length >= 2 && (
+              <button
+                onClick={handleScanDuplicates}
+                className="w-full flex items-center justify-center space-x-1.5 px-3 py-2 text-[11px] font-semibold rounded-xl bg-slate-900/60 hover:bg-slate-800 border border-slate-800 hover:border-amber-500/30 text-slate-300 hover:text-amber-300 transition-all"
+                title="Find the same lead appearing in more than one campaign"
+              >
+                <Search className="h-3.5 w-3.5" />
+                <span>Scan for duplicate leads across campaigns</span>
+              </button>
+            )}
 
             {campaigns.length === 0 ? (
               <div className="p-4 rounded-xl border border-dashed border-slate-800 bg-slate-900/20 text-center space-y-3">
