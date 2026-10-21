@@ -8,6 +8,15 @@ import {
   classifyGeminiError,
   buildProspectingKit,
   csvCell,
+  levenshtein,
+  nameSimilarity,
+  dedupeLeadsFuzzy,
+  parseCSV,
+  mapCsvHeaders,
+  rowToLead,
+  importLeadsFromCSV,
+  scoreLeadCompleteness,
+  campaignDataQuality,
 } from "../src/lib/leads.js";
 
 // normalizeDomain
@@ -63,5 +72,125 @@ assert.ok(kit[0].query.includes("Dental Clinics"));
 // csvCell
 assert.equal(csvCell('say "hi", ok'), '"say ""hi"", ok"');
 assert.equal(csvCell("plain"), "plain");
+
+// levenshtein
+assert.equal(levenshtein("acme", "acme"), 0);
+assert.equal(levenshtein("", "abc"), 3);
+assert.equal(levenshtein("kitten", "sitting"), 3);
+assert.equal(levenshtein("acme dental", "acme dnetal"), 2);
+
+// nameSimilarity
+assert.equal(nameSimilarity("Acme Inc", "ACME LLC"), 1);
+assert.ok(nameSimilarity("Acme Dental", "Acme Dentals") > 0.85);
+assert.ok(nameSimilarity("Acme Dental", "Beta Plumbing") < 0.5);
+assert.equal(nameSimilarity("", "x"), 0);
+
+// dedupeLeadsFuzzy: exact dupes removed; fuzzy name dupes (no domain) merged
+{
+  const r = dedupeLeadsFuzzy([
+    { companyName: "Acme Dental", website: "" },
+    { companyName: "Acme Dentals", website: "" }, // single-char typo, no domain -> fuzzy dup
+    { companyName: "Beta Inc", website: "https://beta.com" },
+    { companyName: "Beta Corp", website: "https://beta.com/" }, // exact domain dup
+    { companyName: "Gamma LLC", website: "" },
+  ]);
+  assert.equal(r.leads.length, 3);
+  assert.equal(r.fuzzy, 1);
+  assert.ok(r.leads.some((l) => l.companyName === "Acme Dental"));
+}
+// threshold=1 behaves like the exact dedupe (no fuzzy merging)
+{
+  const r = dedupeLeadsFuzzy(
+    [
+      { companyName: "Acme Dental", website: "" },
+      { companyName: "Acme Dentals", website: "" },
+    ],
+    1
+  );
+  assert.equal(r.leads.length, 2);
+  assert.equal(r.fuzzy, 0);
+}
+
+// parseCSV: quotes, escaped quotes, embedded commas and newlines
+{
+  const rows = parseCSV('a,b,c\n"x, y","say ""hi""",plain\n"multi\nline",z,');
+  assert.deepEqual(rows, [
+    ["a", "b", "c"],
+    ["x, y", 'say "hi"', "plain"],
+    ["multi\nline", "z", ""],
+  ]);
+}
+assert.deepEqual(parseCSV("\uFEFFh1,h2\nv1,v2\n"), [["h1", "h2"], ["v1", "v2"]]);
+assert.deepEqual(parseCSV(""), []);
+assert.deepEqual(parseCSV("a,b\n\n"), [["a", "b"]]); // trailing empty row ignored
+
+// mapCsvHeaders
+{
+  const m = mapCsvHeaders(["Company Name", "URL", "E-mail", "Phone Number", "Score", "Weird Column"]);
+  assert.deepEqual(m, ["companyName", "website", "email", "phone", "warmthScore", null]);
+}
+
+// rowToLead: sanitize bad website/email, clamp warmth, default status
+{
+  const mapping = ["companyName", "website", "email", "warmthScore", "status"];
+  const l = rowToLead(["Acme", "notaurl", "bad-email", "150", ""], mapping);
+  assert.equal(l.companyName, "Acme");
+  assert.equal(l.website, undefined);
+  assert.equal(l.email, undefined);
+  assert.equal(l.warmthScore, 100);
+  assert.equal(l.status, "New");
+  assert.equal(rowToLead(["", "", "", "", ""], mapping), null);
+}
+
+// importLeadsFromCSV: header mapping, dedupe, error notes
+{
+  const csv = [
+    "Company,Website,Contact Name,Email,Phone,Score",
+    'Acme Dental,https://acme.com,Jane Smith,jane@acme.com,555-0100,92',
+    "Acme Dental,https://acme.com,Jane Smith,jane@acme.com,555-0100,92",
+    ",https://nobody.com,x,x,555-0000,10",
+    "Beta Roofing,,Bob,bob@beta.com,,60",
+  ].join("\n");
+  const res = importLeadsFromCSV(csv);
+  assert.equal(res.parsed, 4);
+  assert.equal(res.leads.length, 2);
+  assert.equal(res.dropped, 1);
+  assert.equal(res.removedDuplicates, 1);
+  assert.ok(res.errors.length > 0);
+}
+assert.ok(importLeadsFromCSV("").errors.length > 0);
+assert.ok(importLeadsFromCSV("foo,bar\n1,2").errors[0].includes("Could not recognize"));
+
+// scoreLeadCompleteness
+{
+  const full = scoreLeadCompleteness({
+    companyName: "Acme",
+    website: "https://acme.com",
+    contactName: "Jane",
+    contactTitle: "Owner",
+    email: "j@acme.com",
+    phone: "555",
+    leadReason: "good fit",
+    sourcedFromUrl: "https://x.com",
+  });
+  assert.equal(full.score, 100);
+  assert.equal(full.grade, "A");
+  assert.deepEqual(full.missing, []);
+
+  const bare = scoreLeadCompleteness({ companyName: "Acme", website: "https://acme.com" });
+  assert.equal(bare.score, 27);
+  assert.equal(bare.grade, "F");
+  assert.ok(bare.missing.includes("Email"));
+}
+
+// campaignDataQuality
+assert.equal(campaignDataQuality([]), 0);
+assert.equal(
+  campaignDataQuality([
+    { companyName: "A", website: "https://a.com", contactName: "J", contactTitle: "T", email: "j@a.com", phone: "1", leadReason: "r", sourcedFromUrl: "u" },
+    { companyName: "B" },
+  ]),
+  58
+);
 
 console.log("All helper tests passed.");

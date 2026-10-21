@@ -1,10 +1,15 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import {
   dedupeLeads,
+  dedupeLeadsFuzzy,
   validateWizardForm,
   classifyGeminiError,
   buildProspectingKit,
   csvCell,
+  parseCSV,
+  importLeadsFromCSV,
+  scoreLeadCompleteness,
+  campaignDataQuality,
 } from './lib/leads.js';
 import { 
   Briefcase, 
@@ -79,6 +84,16 @@ export default function App() {
   const [statusFilter, setStatusFilter] = useState('all');
   const [sortBy, setSortBy] = useState('warmth');
   const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  // CSV import modal
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [importText, setImportText] = useState('');
+  const [importPreview, setImportPreview] = useState(null);
+  const [importing, setImporting] = useState(false);
+
+  // Batch lead selection (dashboard)
+  const [selectedLeadIds, setSelectedLeadIds] = useState([]);
+  const [batchStatus, setBatchStatus] = useState('');
   
   // Anti-Abuse and Claim Tracking States
   const [sessionToken, setSessionToken] = useState('');
@@ -724,7 +739,7 @@ export default function App() {
           customHook: (l.customHook || '').trim(),
           sourcedFromUrl: (l.sourcedFromUrl || '').trim(),
         }));
-      const { leads: uniqueLeads, removed } = dedupeLeads(sanitized);
+      const { leads: uniqueLeads, removed } = dedupeLeadsFuzzy(sanitized);
       if (removed > 0) {
         console.info(`[getleads] Removed ${removed} duplicate lead row(s) before saving.`);
       }
@@ -908,6 +923,11 @@ export default function App() {
       case 'status':
         list.sort((a, b) => (a.status || '').localeCompare(b.status || ''));
         break;
+      case 'quality':
+        list.sort(
+          (a, b) => scoreLeadCompleteness(b).score - scoreLeadCompleteness(a).score
+        );
+        break;
       case 'warmth':
       default:
         list.sort((a, b) => (Number(b.warmthScore) || 0) - (Number(a.warmthScore) || 0));
@@ -967,6 +987,122 @@ export default function App() {
     link.click();
     document.body.removeChild(link);
     setTimeout(() => URL.revokeObjectURL(url), 5000);
+  };
+
+  // Clear the lead selection whenever the active campaign or filters change
+  useEffect(() => {
+    setSelectedLeadIds([]);
+    setBatchStatus('');
+  }, [activeCampaignId, leadFilter, statusFilter, sortBy]);
+
+  const toggleLeadSelected = (id) => {
+    setSelectedLeadIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
+  };
+
+  const toggleSelectShown = () => {
+    const ids = filteredLeads.map((l) => l.id);
+    const allSelected = ids.length > 0 && ids.every((id) => selectedLeadIds.includes(id));
+    setSelectedLeadIds(allSelected ? [] : ids);
+  };
+
+  // Apply one status to every selected lead in one go
+  const handleBatchStatus = () => {
+    if (!batchStatus || !selectedLeadIds.length || !activeCampaign) return;
+    const updatedCampaigns = campaigns.map((camp) => {
+      if (camp.id !== activeCampaignId) return camp;
+      const updatedLeads = camp.leads.map((lead) =>
+        selectedLeadIds.includes(lead.id) ? { ...lead, status: batchStatus } : lead
+      );
+      return { ...camp, leads: updatedLeads };
+    });
+    saveCampaigns(updatedCampaigns);
+    setSelectedLeadIds([]);
+    setBatchStatus('');
+  };
+
+  // Remove every selected lead (confirm first — this is destructive)
+  const handleBatchDelete = () => {
+    if (!selectedLeadIds.length || !activeCampaign) return;
+    if (!window.confirm(`Delete ${selectedLeadIds.length} selected lead(s)? This cannot be undone.`)) return;
+    const updatedCampaigns = campaigns.map((camp) => {
+      if (camp.id !== activeCampaignId) return camp;
+      return { ...camp, leads: camp.leads.filter((lead) => !selectedLeadIds.includes(lead.id)) };
+    });
+    saveCampaigns(updatedCampaigns);
+    if (selectedLead && selectedLeadIds.includes(selectedLead.id)) setSelectedLead(null);
+    setSelectedLeadIds([]);
+  };
+
+  /* ---------------- CSV import (bring your own list) ---------------- */
+
+  // Analyze pasted/uploaded CSV and show a preview before anything is saved
+  const handleImportPreview = (text) => {
+    const t = (text || '').trim();
+    if (!t) {
+      setImportPreview({ leads: [], parsed: 0, dropped: 0, removedDuplicates: 0, errors: ["Paste CSV text or choose a file first."] });
+      return;
+    }
+    setImportPreview(importLeadsFromCSV(t));
+  };
+
+  const handleImportFile = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = String(e.target.result || '');
+      setImportText(text);
+      handleImportPreview(text);
+    };
+    reader.readAsText(file);
+  };
+
+  // Save the previewed import as a new campaign
+  const handleConfirmImport = () => {
+    if (!importPreview || !importPreview.leads.length || importing) return;
+    setImporting(true);
+    const leads = importPreview.leads.map((l, index) => ({
+      ...l,
+      id: `lead_csv_${Date.now()}_${index}`,
+      notes: l.notes || '',
+    }));
+    const campaign = {
+      id: 'camp_csv_' + Date.now(),
+      date: new Date().toLocaleDateString(),
+      businessInfo: {
+        name: 'CSV Import',
+        website: '',
+        description: 'Imported from CSV',
+        coreOffer: '',
+        valueProposition: '',
+        targetIndustry: '',
+        targetLocation: '',
+        targetRole: '',
+      },
+      leads,
+      groundingAttributions: [],
+      outreachTemplates: {
+        warmEmail: `Hi {{ContactName}},\n\nI noticed {{CompanyName}} and wanted to reach out. {{CustomHook}}\n\nBest,\n${userProfile.senderName}\n${userProfile.senderCompany}`,
+        coldCallScript: `Hi {{ContactName}}, it's ${userProfile.senderName} from ${userProfile.senderCompany}. Quick question about {{CompanyName}}...`,
+        linkedinMessage: `Hi {{ContactName}}, loved what you're doing at {{CompanyName}}. Let's connect! - ${userProfile.senderName}`,
+      },
+    };
+    const updated = [campaign, ...campaigns];
+    saveCampaigns(updated);
+    setActiveCampaignId(campaign.id);
+    setSelectedLead(leads[0] || null);
+    setImporting(false);
+    setShowImportModal(false);
+    setImportText('');
+    setImportPreview(null);
+    setViewMode('dashboard');
+  };
+
+  const openImportModal = () => {
+    setImportText('');
+    setImportPreview(null);
+    setShowImportModal(true);
   };
 
   // Compile outreach pitch replacing placeholders with active lead data
@@ -1174,6 +1310,118 @@ export default function App() {
                   Save Profile Settings
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CSV Import Modal */}
+      {showImportModal && (
+        <div className="fixed inset-0 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl p-6 relative shadow-2xl flex flex-col max-h-[88vh]">
+            <button
+              onClick={() => setShowImportModal(false)}
+              className="absolute right-4 top-4 text-slate-400 hover:text-slate-200 transition-colors"
+            >
+              <X className="h-5 w-5" />
+            </button>
+
+            <div className="flex items-center space-x-2 border-b border-slate-800 pb-3 mb-4">
+              <Download className="h-5 w-5 text-cyan-400 rotate-180" />
+              <h3 className="font-bold text-lg text-slate-100">Import Leads from CSV</h3>
+            </div>
+
+            <p className="text-xs text-slate-400 leading-relaxed mb-3">
+              Paste CSV text or choose a file. Expected columns (case-insensitive, any order):
+              <code className="font-mono text-slate-300"> Company, Website, Contact Name, Contact Title, Email, Phone, Score, Reason, Notes</code>.
+              Rows without a company name are skipped; duplicates are removed automatically (exact + fuzzy matching).
+            </p>
+
+            <div className="flex flex-col sm:flex-row gap-2.5 mb-3">
+              <label className="flex-1 cursor-pointer bg-slate-950 border border-dashed border-slate-700 rounded-xl px-4 py-3 text-xs text-slate-300 hover:border-cyan-500 transition-colors text-center">
+                <input
+                  type="file"
+                  accept=".csv,text/csv"
+                  className="hidden"
+                  onChange={(e) => handleImportFile(e.target.files[0])}
+                />
+                <span>📁 Choose CSV file…</span>
+              </label>
+              <button
+                onClick={() => handleImportPreview(importText)}
+                className="px-5 py-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-cyan-300 text-xs font-bold border border-slate-700 transition-all"
+              >
+                Preview
+              </button>
+            </div>
+
+            <textarea
+              rows={7}
+              placeholder={"Company,Website,Contact Name,Email,Phone\nAcme Dental,https://acme.com,Jane Smith,jane@acme.com,204-555-0100"}
+              value={importText}
+              onChange={(e) => setImportText(e.target.value)}
+              className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-xs text-slate-200 font-mono focus:outline-none focus:border-cyan-500 resize-y placeholder:text-slate-700"
+            />
+
+            {importPreview && (
+              <div className="mt-4 p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3 overflow-y-auto">
+                <div className="flex flex-wrap gap-2 text-[11px] font-bold">
+                  <span className="px-2.5 py-1 rounded-full bg-slate-800 text-slate-300">{importPreview.parsed} rows read</span>
+                  <span className="px-2.5 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400">{importPreview.leads.length} importable</span>
+                  {importPreview.dropped > 0 && (
+                    <span className="px-2.5 py-1 rounded-full bg-red-500/10 border border-red-500/20 text-red-400">{importPreview.dropped} skipped</span>
+                  )}
+                  {importPreview.removedDuplicates > 0 && (
+                    <span className="px-2.5 py-1 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-400">{importPreview.removedDuplicates} duplicates removed</span>
+                  )}
+                </div>
+                {importPreview.errors.map((err, i) => (
+                  <p key={i} className="text-[11px] text-slate-400">• {err}</p>
+                ))}
+                {importPreview.leads.length > 0 && (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-[11px] text-slate-300">
+                      <thead>
+                        <tr className="text-left text-slate-500 uppercase">
+                          <th className="py-1 pr-3">Company</th>
+                          <th className="py-1 pr-3">Website</th>
+                          <th className="py-1 pr-3">Contact</th>
+                          <th className="py-1">Email</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {importPreview.leads.slice(0, 5).map((l, i) => (
+                          <tr key={i} className="border-t border-slate-800/60">
+                            <td className="py-1.5 pr-3 font-semibold">{l.companyName}</td>
+                            <td className="py-1.5 pr-3 text-slate-400">{l.website || '—'}</td>
+                            <td className="py-1.5 pr-3 text-slate-400">{l.contactName || '—'}</td>
+                            <td className="py-1.5 text-slate-400 font-mono">{l.email || '—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {importPreview.leads.length > 5 && (
+                      <p className="text-[11px] text-slate-500 mt-1">…and {importPreview.leads.length - 5} more</p>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2.5 pt-4 mt-2 border-t border-slate-800">
+              <button
+                onClick={() => setShowImportModal(false)}
+                className="px-5 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-xl transition-all"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirmImport}
+                disabled={!importPreview || !importPreview.leads.length || importing}
+                className="px-5 py-2.5 bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs rounded-xl transition-all disabled:opacity-40"
+              >
+                {importing ? 'Importing…' : `Import ${importPreview ? importPreview.leads.length : 0} leads as new campaign`}
+              </button>
             </div>
           </div>
         </div>
@@ -1929,6 +2177,14 @@ export default function App() {
 
                   <div className="flex items-center space-x-3">
                     <button 
+                      onClick={openImportModal}
+                      className="flex items-center space-x-1.5 px-3.5 py-2 text-xs font-semibold rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition-all border border-slate-700/60"
+                      title="Import leads from your own CSV file"
+                    >
+                      <Download className="h-3.5 w-3.5 rotate-180" />
+                      <span>Import CSV</span>
+                    </button>
+                    <button 
                       onClick={handleExportCSV}
                       className="flex items-center space-x-1.5 px-3.5 py-2 text-xs font-semibold rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition-all border border-slate-700/60"
                     >
@@ -1957,7 +2213,7 @@ export default function App() {
                 </section>
 
                 {/* Metrics Bar */}
-                <section className="grid grid-cols-2 md:grid-cols-4 border-b border-slate-800/40 bg-slate-900/10 shrink-0">
+                <section className="grid grid-cols-2 md:grid-cols-5 border-b border-slate-800/40 bg-slate-900/10 shrink-0">
                   <div className="p-4 border-r border-slate-800/40 space-y-1 text-center md:text-left">
                     <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Total Scraped Leads</span>
                     <p className="text-2xl font-black text-slate-100">{activeCampaign.leads.length}</p>
@@ -1974,10 +2230,16 @@ export default function App() {
                       {activeCampaign.leads.filter(l => l.status === 'Contacted' || l.status === 'In-Progress' || l.status === 'Converted').length}
                     </p>
                   </div>
-                  <div className="p-4 space-y-1 text-center md:text-left">
+                  <div className="p-4 border-r border-slate-800/40 space-y-1 text-center md:text-left">
                     <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Mean Fit Warmth</span>
                     <p className="text-2xl font-black text-pink-400">
                       {Math.round(activeCampaign.leads.reduce((acc, curr) => acc + curr.warmthScore, 0) / activeCampaign.leads.length || 0)}%
+                    </p>
+                  </div>
+                  <div className="p-4 space-y-1 text-center md:text-left" title="Average completeness of lead records (company, website, contact, email, phone, reason, source)">
+                    <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Data Quality</span>
+                    <p className="text-2xl font-black text-cyan-400">
+                      {campaignDataQuality(activeCampaign.leads)}%
                     </p>
                   </div>
                 </section>
@@ -2046,11 +2308,60 @@ export default function App() {
                             title="Sort leads"
                           >
                             <option value="warmth">Sort: Warmth ↓</option>
+                            <option value="quality">Sort: Data Quality ↓</option>
                             <option value="company">Sort: Company A–Z</option>
                             <option value="status">Sort: Status</option>
                           </select>
                         </div>
                       </div>
+
+                      {/* Batch selection toolbar: appears when leads are shown */}
+                      {filteredLeads.length > 0 && (
+                        <div className="flex flex-wrap items-center gap-2.5 pt-1">
+                          <button
+                            onClick={toggleSelectShown}
+                            className="flex items-center space-x-1.5 px-3 py-1.5 text-[11px] font-semibold rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700/60 transition-all"
+                          >
+                            <span>{filteredLeads.every((l) => selectedLeadIds.includes(l.id)) ? 'Deselect all shown' : 'Select all shown'}</span>
+                          </button>
+                          {selectedLeadIds.length > 0 && (
+                            <>
+                              <span className="text-[11px] font-bold text-indigo-300 bg-indigo-500/10 px-2.5 py-1 rounded-full border border-indigo-500/20">
+                                {selectedLeadIds.length} selected
+                              </span>
+                              <div className="flex items-center gap-2">
+                                <select
+                                  value={batchStatus}
+                                  onChange={(e) => setBatchStatus(e.target.value)}
+                                  className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-indigo-500 appearance-none"
+                                  title="Apply a status to all selected leads"
+                                >
+                                  <option value="">Set status…</option>
+                                  <option value="New">New</option>
+                                  <option value="Contacted">Contacted</option>
+                                  <option value="In-Progress">In-Progress</option>
+                                  <option value="Converted">Converted</option>
+                                  <option value="Unqualified">Unqualified</option>
+                                </select>
+                                <button
+                                  onClick={handleBatchStatus}
+                                  disabled={!batchStatus}
+                                  className="px-3 py-1.5 text-[11px] font-bold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition-all disabled:opacity-40"
+                                >
+                                  Apply
+                                </button>
+                                <button
+                                  onClick={handleBatchDelete}
+                                  className="flex items-center space-x-1 px-3 py-1.5 text-[11px] font-bold rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 transition-all"
+                                >
+                                  <Trash2 className="h-3 w-3" />
+                                  <span>Delete</span>
+                                </button>
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      )}
                     </div>
 
                     <div className="divide-y divide-slate-800/80">
@@ -2077,6 +2388,8 @@ export default function App() {
                       )}
                       {filteredLeads.map((lead) => {
                         const isSelected = selectedLead && selectedLead.id === lead.id;
+                        const isChecked = selectedLeadIds.includes(lead.id);
+                        const dq = scoreLeadCompleteness(lead);
                         return (
                           <div 
                             key={lead.id}
@@ -2087,7 +2400,16 @@ export default function App() {
                                 : 'bg-transparent hover:bg-slate-900/30'
                             }`}
                           >
-                            <div className="space-y-1.5 flex-1 min-w-0">
+                            <div className="flex items-start gap-3 flex-1 min-w-0">
+                              <input
+                                type="checkbox"
+                                checked={isChecked}
+                                onClick={(e) => e.stopPropagation()}
+                                onChange={() => toggleLeadSelected(lead.id)}
+                                className="mt-1 h-4 w-4 rounded accent-indigo-500 cursor-pointer shrink-0"
+                                title="Select lead for batch actions"
+                              />
+                              <div className="space-y-1.5 flex-1 min-w-0">
                               <div className="flex items-center space-x-2.5">
                                 <h4 className="font-bold text-sm text-slate-100 truncate">{lead.companyName}</h4>
                                 {lead.website && (
@@ -2115,6 +2437,7 @@ export default function App() {
                                 <span className="font-semibold text-indigo-400 text-[10px] uppercase mr-1">Match Intent:</span>
                                 {lead.leadReason}
                               </p>
+                              </div>
                             </div>
 
                             <div className="flex items-center md:flex-col items-end gap-3 justify-between">
@@ -2129,6 +2452,20 @@ export default function App() {
                                     : 'bg-slate-500/10 text-slate-400 border border-slate-500/20'
                                 }`}>
                                   {lead.warmthScore}%
+                                </span>
+                              </div>
+
+                              {/* Data-quality badge: how complete/actionable this record is */}
+                              <div className="flex items-center space-x-1" title={`Data quality ${dq.score}/100 (grade ${dq.grade})${dq.missing.length ? ' — missing: ' + dq.missing.join(', ') : ' — all key fields present'}`}>
+                                <span className="text-xs font-semibold text-slate-400">Data:</span>
+                                <span className={`text-xs font-bold px-1.5 py-0.5 rounded ${
+                                  dq.score >= 75
+                                    ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                                    : dq.score >= 55
+                                    ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+                                    : 'bg-slate-500/10 text-slate-400 border border-slate-500/20'
+                                }`}>
+                                  {dq.grade}
                                 </span>
                               </div>
 
