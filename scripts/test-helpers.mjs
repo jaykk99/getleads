@@ -19,6 +19,15 @@ import {
   campaignDataQuality,
   findCrossCampaignDuplicates,
 } from "../src/lib/leads.js";
+import {
+  splitEmail,
+  gradeEmailDomain,
+  scoreDomainQuality,
+  scoreLeadWarmth,
+  warmthTier,
+  campaignWarmthDistribution,
+  rankLeadsByWarmth,
+} from "../src/lib/scoring.js";
 
 // normalizeDomain
 assert.equal(normalizeDomain("https://www.Acme.com/about"), "acme.com");
@@ -229,3 +238,86 @@ assert.equal(
 }
 
 console.log("All helper tests passed.");
+
+// --- scoring.js: lead warmth engine ----------------------------------------
+{
+  // splitEmail
+  assert.deepEqual(splitEmail("Jane@Acme.COM"), { local: "jane", domain: "acme.com" });
+  assert.equal(splitEmail("not-an-email"), null);
+  assert.equal(splitEmail(""), null);
+
+  // gradeEmailDomain
+  assert.equal(gradeEmailDomain("jane@acme.com", "https://acme.com").kind, "corporate");
+  assert.equal(gradeEmailDomain("jane@gmail.com", "https://acme.com").kind, "free");
+  assert.equal(gradeEmailDomain("jane@other.com", "https://acme.com").kind, "mismatch");
+  assert.equal(gradeEmailDomain("bad-email", "").kind, "invalid");
+  // no website on file -> domain can't mismatch, counts as corporate
+  assert.equal(gradeEmailDomain("jane@acme.com", "").kind, "corporate");
+
+  // scoreDomainQuality: 0..30
+  {
+    const q = scoreDomainQuality("https://acme.com");
+    assert.ok(q.points > 20 && q.points <= 30);
+    assert.equal(scoreDomainQuality("").points, 0);
+    const odd = scoreDomainQuality("https://my-shop-1234.xyz");
+    assert.ok(odd.points < q.points);
+  }
+
+  // scoreLeadWarmth: a fully-loaded lead scores Hot; empty lead is Cold
+  const hotLead = {
+    companyName: "Acme Dental",
+    website: "https://acme.com",
+    contactName: "Jane Smith",
+    contactTitle: "Owner",
+    email: "jane@acme.com",
+    phone: "555-0100",
+    linkedinUrl: "https://linkedin.com/company/acme",
+    socialProfiles: ["https://twitter.com/acme"],
+  };
+  const hot = scoreLeadWarmth(hotLead);
+  assert.equal(hot.tier, "Hot");
+  assert.ok(hot.score >= 75);
+  assert.ok(hot.signals.length >= 8);
+  assert.ok(hot.signals.every((s) => typeof s.points === "number"));
+
+  const cold = scoreLeadWarmth({ companyName: "Ghost Co" });
+  assert.equal(cold.tier, "Cold");
+  assert.ok(cold.score < 25);
+
+  const free = scoreLeadWarmth({
+    companyName: "Beta",
+    email: "bob@gmail.com",
+    website: "https://beta.com",
+  });
+  const freeSignal = free.signals.find((s) => s.label === "Email domain");
+  assert.equal(freeSignal.points, 5);
+  assert.ok(freeSignal.detail.includes("gmail.com"));
+
+  const senior = scoreLeadWarmth({ companyName: "X", contactName: "A", contactTitle: "CEO" });
+  assert.ok(senior.signals.find((s) => s.label === "Seniority").points === 5);
+  const junior = scoreLeadWarmth({ companyName: "X", contactName: "A", contactTitle: "Intern" });
+  assert.ok(junior.signals.find((s) => s.label === "Seniority").points === 0);
+
+  // warmthTier boundaries
+  assert.equal(warmthTier(75), "Hot");
+  assert.equal(warmthTier(74), "Warm");
+  assert.equal(warmthTier(50), "Warm");
+  assert.equal(warmthTier(49), "Lukewarm");
+  assert.equal(warmthTier(25), "Lukewarm");
+  assert.equal(warmthTier(24), "Cold");
+  assert.equal(warmthTier(0), "Cold");
+
+  // campaignWarmthDistribution + rankLeadsByWarmth
+  const dist = campaignWarmthDistribution([hotLead, { companyName: "Ghost Co" }]);
+  assert.equal(dist.hot, 1);
+  assert.equal(dist.cold, 1);
+  assert.ok(dist.average > 0 && dist.average <= 100);
+  assert.deepEqual(campaignWarmthDistribution([]), { hot: 0, warm: 0, lukewarm: 0, cold: 0, average: 0 });
+
+  const ranked = rankLeadsByWarmth([{ companyName: "Ghost Co" }, hotLead]);
+  assert.equal(ranked[0].lead.companyName, "Acme Dental");
+  assert.equal(ranked[1].lead.companyName, "Ghost Co");
+  assert.ok(ranked[0].score >= ranked[1].score);
+}
+
+console.log("All scoring tests passed.");
