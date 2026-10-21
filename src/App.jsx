@@ -1099,6 +1099,51 @@ export default function App() {
     setViewMode('dashboard');
   };
 
+  // Merge the previewed import into the currently open campaign instead
+  const handleMergeImport = () => {
+    if (!importPreview || !importPreview.leads.length || importing || !activeCampaign) return;
+    setImporting(true);
+    const fresh = importPreview.leads.map((l, index) => ({
+      ...l,
+      id: `lead_csv_${Date.now()}_${index}`,
+      notes: l.notes || '',
+    }));
+    const { leads: merged, removed } = dedupeLeadsFuzzy([...activeCampaign.leads, ...fresh]);
+    const updatedCampaigns = campaigns.map((camp) =>
+      camp.id === activeCampaignId ? { ...camp, leads: merged } : camp
+    );
+    saveCampaigns(updatedCampaigns);
+    setImporting(false);
+    setShowImportModal(false);
+    setImportText('');
+    setImportPreview(null);
+    setViewMode('dashboard');
+    if (removed) {
+      alert(`Merged ${fresh.length - removed} new lead(s) into "${activeCampaign.businessInfo.name}". ${removed} duplicate(s) skipped.`);
+    }
+  };
+
+  // Export only the selected leads (batch toolbar) to CSV
+  const handleExportSelectedCSV = () => {
+    const rows = (activeCampaign?.leads || []).filter((l) => selectedLeadIds.includes(l.id));
+    if (!rows.length) return;
+    const headers = ["Company Name", "Website", "Decision Maker", "Title", "Email", "Phone", "Warmth Score", "Lead Match Reason", "Sourced From URL", "Status"];
+    const body = rows.map((l) => [
+      l.companyName, l.website, l.contactName, l.contactTitle, l.email, l.phone,
+      l.warmthScore, l.leadReason, (l.sourcedFromUrl || ''), l.status
+    ].map(csvCell).join(","));
+    const csvContent = [headers.map(csvCell).join(","), ...body].join("\n");
+    const blob = new Blob(["\uFEFF" + csvContent], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", `get_leads_selected_${rows.length}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  };
+
   const openImportModal = () => {
     setImportText('');
     setImportPreview(null);
@@ -1415,6 +1460,16 @@ export default function App() {
               >
                 Cancel
               </button>
+              {activeCampaign && (
+                <button
+                  onClick={handleMergeImport}
+                  disabled={!importPreview || !importPreview.leads.length || importing}
+                  className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs rounded-xl transition-all disabled:opacity-40"
+                  title={`Add these leads to "${activeCampaign.businessInfo.name}" (duplicates against existing leads are skipped)`}
+                >
+                  {importing ? 'Merging…' : `Merge into "${activeCampaign.businessInfo.name}"`}
+                </button>
+              )}
               <button
                 onClick={handleConfirmImport}
                 disabled={!importPreview || !importPreview.leads.length || importing}
@@ -2356,6 +2411,14 @@ export default function App() {
                                 >
                                   <Trash2 className="h-3 w-3" />
                                   <span>Delete</span>
+                                </button>
+                                <button
+                                  onClick={handleExportSelectedCSV}
+                                  className="flex items-center space-x-1 px-3 py-1.5 text-[11px] font-bold rounded-lg bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 transition-all"
+                                  title="Export only the selected leads to CSV"
+                                >
+                                  <Download className="h-3 w-3" />
+                                  <span>Export selected</span>
                                 </button>
                               </div>
                             </>
