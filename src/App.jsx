@@ -12,6 +12,55 @@ import {
   campaignDataQuality,
   findCrossCampaignDuplicates,
 } from './lib/leads.js';
+import {
+  scoreLeadWarmth,
+  warmthTier,
+  campaignWarmthDistribution,
+  rankLeadsByWarmth,
+} from './lib/scoring.js';
+import {
+  createFollowUp,
+  completeFollowUp,
+  reopenFollowUp,
+  skipFollowUp,
+  allFollowUps,
+  nextDueForLead,
+  followUpStats,
+  suggestedFollowUpsForLead,
+} from './lib/tasks.js';
+import {
+  DRAFT_ONLY,
+  listSequenceTemplates,
+  renderSequence,
+  sequenceReadiness,
+} from './lib/sequences.js';
+import {
+  createBlacklistEntry,
+  upsertBlacklistEntry,
+  removeBlacklistEntry,
+  checkImportAgainstBlacklist,
+  checkLeadBlacklist,
+} from './lib/blacklist.js';
+import {
+  attributeSource,
+  leadSource,
+  normalizeLeadSource,
+  sourceBreakdown,
+} from './lib/attribution.js';
+import {
+  campaignPerformance,
+  compareCampaigns,
+  pipelineFunnel,
+  warmthHistogram,
+} from './lib/reporting.js';
+import {
+  normalizeTag,
+  addTagsToLead,
+  removeTagsFromLead,
+  bulkAddTags,
+  bulkRemoveTags,
+  allTags,
+} from './lib/tags.js';
 import { 
   Briefcase, 
   Globe, 
@@ -51,7 +100,16 @@ import {
   Menu,
   BookmarkPlus,
   Filter,
-  History
+  History,
+  Flame,
+  CalendarClock,
+  Ban,
+  BarChart3,
+  Tag,
+  ListChecks,
+  MailWarning,
+  ClipboardList,
+  PhoneCall
 } from 'lucide-react';
 
 // Gemini API key injected at build time via Vercel env var (VITE_GEMINI_API_KEY).
@@ -95,6 +153,29 @@ export default function App() {
   // Batch lead selection (dashboard)
   const [selectedLeadIds, setSelectedLeadIds] = useState([]);
   const [batchStatus, setBatchStatus] = useState('');
+
+  // --- Feature-engine workspace state (wires src/lib engines into the UI) ---
+  // Dashboard section tabs: leads table, follow-up task board, campaign
+  // reports, blacklist (do-not-contact) manager.
+  const [dashTab, setDashTab] = useState('leads'); // leads | followups | reports | blacklist
+  // Lead detail panel tabs inside the right-hand Contact Center column.
+  const [leadPanelTab, setLeadPanelTab] = useState('profile'); // profile | warmth | followups | sequences
+  // Follow-up task draft for the currently selected lead.
+  const [taskDraft, setTaskDraft] = useState({ title: '', dueDate: '', priority: 'normal', notes: '' });
+  const [taskFormError, setTaskFormError] = useState('');
+  // Email sequence template key for the sequence preview (drafts only).
+  const [seqTemplateKey, setSeqTemplateKey] = useState('email_warm');
+  // Per-lead tag editor input.
+  const [tagInput, setTagInput] = useState('');
+  // Batch-bar tag input (bulk add/remove across selected leads).
+  const [batchTagInput, setBatchTagInput] = useState('');
+  // Blacklist / do-not-contact entries, persisted in localStorage.
+  const [blacklist, setBlacklist] = useState([]);
+  const [blDraft, setBlDraft] = useState({ type: 'domain', value: '', reason: '' });
+  const [blFormError, setBlFormError] = useState('');
+  const [blQuery, setBlQuery] = useState('');
+  // Which campaign's report is open in the reports tab.
+  const [reportCampaignId, setReportCampaignId] = useState(null);
 
   // Cross-campaign duplicate scan report
   const [showDupesModal, setShowDupesModal] = useState(false);
@@ -230,6 +311,17 @@ export default function App() {
         if (Array.isArray(parsed)) setSavedSearches(parsed);
       } catch (e) {
         console.error("Failed to load saved searches", e);
+      }
+    }
+
+    // Load blacklist / do-not-contact entries
+    const blRaw = localStorage.getItem('get_leads_blacklist');
+    if (blRaw) {
+      try {
+        const parsed = JSON.parse(blRaw);
+        if (Array.isArray(parsed)) setBlacklist(parsed);
+      } catch (e) {
+        console.error("Failed to load blacklist", e);
       }
     }
   }, []);
@@ -1045,6 +1137,142 @@ export default function App() {
     setSelectedLeadIds([]);
   };
 
+  // Persist the blacklist / do-not-contact list.
+  const saveBlacklist = (list) => {
+    setBlacklist(list);
+    localStorage.setItem('get_leads_blacklist', JSON.stringify(list));
+  };
+
+  // Add a blacklist entry (domain / email / company name).
+  const handleAddBlacklistEntry = () => {
+    try {
+      const entry = createBlacklistEntry(blDraft);
+      saveBlacklist(upsertBlacklistEntry(blacklist, entry));
+      setBlDraft({ type: 'domain', value: '', reason: '' });
+      setBlFormError('');
+    } catch (e) {
+      setBlFormError(e.message || 'Invalid blacklist entry.');
+    }
+  };
+
+  // Remove a blacklist entry by id.
+  const handleRemoveBlacklistEntry = (id) => {
+    saveBlacklist(removeBlacklistEntry(blacklist, id));
+  };
+
+  // --- Follow-up tasks (per selected lead) ---------------------------------
+  // Mutates the selected lead's followUps array inside the active campaign.
+  const updateLeadFollowUps = (leadId, nextFollowUps) => {
+    handleUpdateLead(leadId, { followUps: nextFollowUps });
+  };
+
+  const handleAddFollowUp = () => {
+    if (!selectedLead) return;
+    const draft = {
+      title: taskDraft.title,
+      dueDate: taskDraft.dueDate || undefined,
+      priority: taskDraft.priority,
+      notes: taskDraft.notes,
+    };
+    try {
+      const task = createFollowUp(selectedLead.id, draft);
+      const next = [...(selectedLead.followUps || []), task];
+      updateLeadFollowUps(selectedLead.id, next);
+      setTaskDraft({ title: '', dueDate: '', priority: 'normal', notes: '' });
+      setTaskFormError('');
+    } catch (e) {
+      setTaskFormError(e.message || 'Invalid task.');
+    }
+  };
+
+  // One-click: attach the engine's suggested follow-up cadence to the lead.
+  const handleAddSuggestedFollowUps = () => {
+    if (!selectedLead) return;
+    const existing = new Set((selectedLead.followUps || []).map((t) => t.title));
+    const fresh = suggestedFollowUpsForLead(selectedLead)
+      .filter((d) => !existing.has(d.title))
+      .map((d) => createFollowUp(selectedLead.id, d));
+    if (!fresh.length) return;
+    updateLeadFollowUps(selectedLead.id, [...(selectedLead.followUps || []), ...fresh]);
+  };
+
+  // Toggle a task between open/done/skipped from any board surface.
+  const mutateTaskInCampaigns = (leadId, taskId, mutator) => {
+    const updatedCampaigns = campaigns.map((camp) => {
+      const updatedLeads = camp.leads.map((lead) => {
+        if (lead.id !== leadId) return lead;
+        const followUps = (lead.followUps || []).map((t) =>
+          t.id === taskId ? mutator(t) : t
+        );
+        const updated = { ...lead, followUps };
+        if (selectedLead && selectedLead.id === leadId) setSelectedLead(updated);
+        return updated;
+      });
+      return { ...camp, leads: updatedLeads };
+    });
+    saveCampaigns(updatedCampaigns);
+  };
+
+  const handleCompleteTask = (leadId, taskId) => mutateTaskInCampaigns(leadId, taskId, completeFollowUp);
+  const handleReopenTask = (leadId, taskId) => mutateTaskInCampaigns(leadId, taskId, reopenFollowUp);
+  const handleSkipTask = (leadId, taskId, reason) => mutateTaskInCampaigns(leadId, taskId, (t) => skipFollowUp(t, reason));
+
+  // --- Tags (per lead + bulk) ------------------------------------------------
+  const handleAddLeadTag = () => {
+    if (!selectedLead || !tagInput.trim()) return;
+    const updated = addTagsToLead(selectedLead, [tagInput]);
+    if (JSON.stringify(updated.tags) !== JSON.stringify(selectedLead.tags)) {
+      handleUpdateLead(selectedLead.id, { tags: updated.tags });
+    }
+    setTagInput('');
+  };
+
+  const handleRemoveLeadTag = (tag) => {
+    if (!selectedLead) return;
+    const updated = removeTagsFromLead(selectedLead, [tag]);
+    handleUpdateLead(selectedLead.id, { tags: updated.tags });
+  };
+
+  const handleBulkAddTags = () => {
+    if (!batchTagInput.trim() || !selectedLeadIds.length || !activeCampaign) return;
+    const updatedCampaigns = campaigns.map((camp) => {
+      if (camp.id !== activeCampaignId) return camp;
+      const { leads } = bulkAddTags(camp.leads, selectedLeadIds, [batchTagInput]);
+      return { ...camp, leads };
+    });
+    saveCampaigns(updatedCampaigns);
+    setBatchTagInput('');
+  };
+
+  const handleBulkRemoveTags = () => {
+    if (!batchTagInput.trim() || !selectedLeadIds.length || !activeCampaign) return;
+    const updatedCampaigns = campaigns.map((camp) => {
+      if (camp.id !== activeCampaignId) return camp;
+      const { leads } = bulkRemoveTags(camp.leads, selectedLeadIds, [batchTagInput]);
+      return { ...camp, leads };
+    });
+    saveCampaigns(updatedCampaigns);
+    setBatchTagInput('');
+  };
+
+  // Derived dashboard data (memoized per campaign).
+  const followUpsBoard = useMemo(
+    () => (activeCampaign ? allFollowUps(activeCampaign) : []),
+    [activeCampaign]
+  );
+  const campaignStats = useMemo(
+    () => (activeCampaign ? followUpStats(activeCampaign) : null),
+    [activeCampaign]
+  );
+  const reportData = useMemo(() => {
+    const c = campaigns.find((x) => x.id === (reportCampaignId || activeCampaignId));
+    return c ? campaignPerformance(c) : null;
+  }, [campaigns, reportCampaignId, activeCampaignId]);
+  const campaignCompareRows = useMemo(
+    () => compareCampaigns(campaigns),
+    [campaigns]
+  );
+
   /* ---------------- CSV import (bring your own list) ---------------- */
 
   // Analyze pasted/uploaded CSV and show a preview before anything is saved
@@ -1054,7 +1282,10 @@ export default function App() {
       setImportPreview({ leads: [], parsed: 0, dropped: 0, removedDuplicates: 0, errors: ["Paste CSV text or choose a file first."] });
       return;
     }
-    setImportPreview(importLeadsFromCSV(t));
+    const preview = importLeadsFromCSV(t);
+    // Do-not-contact gate: leads matching the blacklist never reach the campaign.
+    const { allowed, blockedCount, notes } = checkImportAgainstBlacklist(preview.leads, blacklist);
+    setImportPreview({ ...preview, leads: allowed, blockedCount, blockedNotes: notes });
   };
 
   const handleImportFile = (file) => {
@@ -1073,7 +1304,7 @@ export default function App() {
     if (!importPreview || !importPreview.leads.length || importing) return;
     setImporting(true);
     const leads = importPreview.leads.map((l, index) => ({
-      ...l,
+      ...normalizeLeadSource(l),
       id: `lead_csv_${Date.now()}_${index}`,
       notes: l.notes || '',
     }));
@@ -1114,7 +1345,7 @@ export default function App() {
     if (!importPreview || !importPreview.leads.length || importing || !activeCampaign) return;
     setImporting(true);
     const fresh = importPreview.leads.map((l, index) => ({
-      ...l,
+      ...normalizeLeadSource(l),
       id: `lead_csv_${Date.now()}_${index}`,
       notes: l.notes || '',
     }));
@@ -1498,10 +1729,21 @@ export default function App() {
                   {importPreview.removedDuplicates > 0 && (
                     <span className="px-2.5 py-1 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-400">{importPreview.removedDuplicates} duplicates removed</span>
                   )}
+                  {importPreview.blockedCount > 0 && (
+                    <span className="px-2.5 py-1 rounded-full bg-purple-500/10 border border-purple-500/20 text-purple-400">{importPreview.blockedCount} blocked by do-not-contact list</span>
+                  )}
                 </div>
                 {importPreview.errors.map((err, i) => (
                   <p key={i} className="text-[11px] text-slate-400">• {err}</p>
                 ))}
+                {(importPreview.blockedNotes || []).length > 0 && (
+                  <div className="p-2.5 rounded-lg bg-purple-500/5 border border-purple-500/20 space-y-1">
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-purple-400">Blocked by do-not-contact list</p>
+                    {importPreview.blockedNotes.map((note, i) => (
+                      <p key={i} className="text-[11px] text-slate-400">• {note}</p>
+                    ))}
+                  </div>
+                )}
                 {importPreview.leads.length > 0 && (
                   <div className="overflow-x-auto">
                     <table className="w-full text-[11px] text-slate-300">
@@ -2357,6 +2599,36 @@ export default function App() {
                   </div>
                 </section>
 
+                {/* Dashboard section tabs */}
+                <nav className="flex items-center gap-1 px-6 py-2.5 bg-slate-950/40 border-b border-slate-800/60 shrink-0">
+                  {[
+                    { key: 'leads', label: 'Leads', icon: Users },
+                    { key: 'followups', label: 'Follow-ups', icon: CalendarClock, badge: campaignStats && campaignStats.open > 0 ? campaignStats.open : null },
+                    { key: 'reports', label: 'Reports', icon: BarChart3 },
+                    { key: 'blacklist', label: 'Do-not-contact', icon: Ban, badge: blacklist.length > 0 ? blacklist.length : null },
+                  ].map(({ key, label, icon: Icon, badge }) => (
+                    <button
+                      key={key}
+                      onClick={() => setDashTab(key)}
+                      className={`flex items-center space-x-1.5 px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all ${
+                        dashTab === key
+                          ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20'
+                          : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+                      }`}
+                    >
+                      <Icon className="h-3.5 w-3.5" />
+                      <span>{label}</span>
+                      {badge !== null && badge !== undefined && (
+                        <span className={`text-[10px] font-black px-1.5 py-0.5 rounded-full ${dashTab === key ? 'bg-white/20 text-white' : 'bg-slate-800 text-slate-300'}`}>
+                          {badge}
+                        </span>
+                      )}
+                    </button>
+                  ))}
+                </nav>
+
+                {dashTab === 'leads' && (
+                <>
                 {/* Metrics Bar */}
                 <section className="grid grid-cols-2 md:grid-cols-5 border-b border-slate-800/40 bg-slate-900/10 shrink-0">
                   <div className="p-4 border-r border-slate-800/40 space-y-1 text-center md:text-left">
@@ -2510,6 +2782,32 @@ export default function App() {
                                   <Download className="h-3 w-3" />
                                   <span>Export selected</span>
                                 </button>
+                                <div className="flex items-center gap-1.5">
+                                  <input
+                                    type="text"
+                                    placeholder="tag…"
+                                    value={batchTagInput}
+                                    onChange={(e) => setBatchTagInput(e.target.value)}
+                                    className="w-24 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-indigo-500 placeholder:text-slate-600"
+                                    title="Tag to add to / remove from all selected leads"
+                                  />
+                                  <button
+                                    onClick={handleBulkAddTags}
+                                    disabled={!batchTagInput.trim()}
+                                    className="px-2.5 py-1.5 text-[11px] font-bold rounded-lg bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 border border-indigo-500/20 transition-all disabled:opacity-40"
+                                    title="Add this tag to all selected leads"
+                                  >
+                                    +Tag
+                                  </button>
+                                  <button
+                                    onClick={handleBulkRemoveTags}
+                                    disabled={!batchTagInput.trim()}
+                                    className="px-2.5 py-1.5 text-[11px] font-bold rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-all disabled:opacity-40"
+                                    title="Remove this tag from all selected leads"
+                                  >
+                                    −Tag
+                                  </button>
+                                </div>
                               </div>
                             </>
                           )}
@@ -2750,6 +3048,31 @@ export default function App() {
                           </div>
                         </div>
 
+                        {/* Lead workspace tabs: Profile | Warmth | Follow-ups | Sequences */}
+                        <div className="grid grid-cols-4 gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800">
+                          {[
+                            { key: 'profile', label: 'Profile', icon: User },
+                            { key: 'warmth', label: 'Warmth', icon: Flame },
+                            { key: 'followups', label: 'Follow-ups', icon: CalendarClock },
+                            { key: 'sequences', label: 'Sequences', icon: Mail },
+                          ].map(({ key, label, icon: Icon }) => (
+                            <button
+                              key={key}
+                              onClick={() => setLeadPanelTab(key)}
+                              className={`py-1.5 px-1 rounded-lg text-[11px] font-semibold transition-all flex items-center justify-center space-x-1 ${
+                                leadPanelTab === key
+                                  ? 'bg-slate-800 text-white shadow-sm'
+                                  : 'text-slate-400 hover:text-slate-300'
+                              }`}
+                            >
+                              <Icon className="h-3.5 w-3.5" />
+                              <span className="hidden sm:inline">{label}</span>
+                            </button>
+                          ))}
+                        </div>
+
+                        {leadPanelTab === 'profile' && (
+                        <>
                         {/* AI Generated Personalized Communication copy */}
                         <div className="space-y-3 pt-2">
                           <div className="flex items-center justify-between">
@@ -2839,6 +3162,269 @@ export default function App() {
                             className="w-full bg-slate-950 border border-slate-850 rounded-xl px-3 py-2 text-xs text-slate-300 focus:outline-none focus:border-indigo-500 transition-colors placeholder:text-slate-700 font-sans"
                           />
                         </div>
+
+                        {/* Lead tags */}
+                        <div className="space-y-2 pt-2">
+                          <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">Tags</label>
+                          <div className="flex flex-wrap gap-1.5">
+                            {(selectedLead.tags || []).map((t) => (
+                              <span
+                                key={t}
+                                className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-full bg-indigo-500/10 border border-indigo-500/20 text-indigo-300 text-[11px] font-semibold"
+                              >
+                                <span>{t}</span>
+                                <button onClick={() => handleRemoveLeadTag(t)} className="hover:text-white" title={`Remove tag ${t}`}>
+                                  <X className="h-3 w-3" />
+                                </button>
+                              </span>
+                            ))}
+                            {(selectedLead.tags || []).length === 0 && (
+                              <span className="text-[11px] text-slate-600">No tags yet.</span>
+                            )}
+                          </div>
+                          <div className="flex gap-2">
+                            <input
+                              type="text"
+                              placeholder="Add tag, press Enter…"
+                              value={tagInput}
+                              onChange={(e) => setTagInput(e.target.value)}
+                              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleAddLeadTag(); } }}
+                              className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 placeholder:text-slate-600"
+                            />
+                            <button
+                              onClick={handleAddLeadTag}
+                              className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-xl border border-slate-700 transition-all"
+                            >
+                              Add
+                            </button>
+                          </div>
+                        </div>
+                        </>
+                        )}
+
+                        {/* --- Warmth breakdown tab (scoring engine) --- */}
+                        {leadPanelTab === 'warmth' && selectedLead && (() => {
+                          const { score, tier, signals } = scoreLeadWarmth(selectedLead);
+                          const tierColor =
+                            tier === 'Hot' ? 'text-red-400 bg-red-500/10 border-red-500/20'
+                            : tier === 'Warm' ? 'text-amber-400 bg-amber-500/10 border-amber-500/20'
+                            : tier === 'Lukewarm' ? 'text-cyan-400 bg-cyan-500/10 border-cyan-500/20'
+                            : 'text-slate-400 bg-slate-500/10 border-slate-500/20';
+                          return (
+                            <div className="space-y-3 pt-2">
+                              <div className="flex items-center justify-between">
+                                <span className="text-xs font-bold uppercase tracking-wider text-slate-400">Reachability Score</span>
+                                <span className={`px-2.5 py-1 rounded-full border text-xs font-bold ${tierColor}`}>
+                                  {tier} · {score}/100
+                                </span>
+                              </div>
+                              <p className="text-[11px] text-slate-500 leading-relaxed">
+                                Deterministic heuristic: how reachable this lead is (email, domain, website,
+                                social presence, decision-maker, phone) — not AI fit.
+                              </p>
+                              <div className="space-y-2">
+                                {signals.map((s, i) => (
+                                  <div key={i} className="p-2.5 rounded-xl bg-slate-950 border border-slate-850 space-y-1">
+                                    <div className="flex items-center justify-between">
+                                      <span className="text-xs font-semibold text-slate-200">{s.label}</span>
+                                      <span className={`text-xs font-bold ${s.points > 0 ? 'text-emerald-400' : 'text-slate-500'}`}>
+                                        +{s.points}
+                                      </span>
+                                    </div>
+                                    <p className="text-[11px] text-slate-500 leading-relaxed">{s.detail}</p>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })()}
+
+                        {/* --- Follow-ups tab (task engine) --- */}
+                        {leadPanelTab === 'followups' && selectedLead && (
+                          <div className="space-y-3 pt-2">
+                            <div className="flex items-center justify-between">
+                              <span className="text-xs font-bold uppercase tracking-wider text-slate-400">Follow-up Tasks</span>
+                              <button
+                                onClick={handleAddSuggestedFollowUps}
+                                className="px-2.5 py-1.5 text-[11px] font-semibold rounded-lg bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 transition-all"
+                                title="Attach the suggested initial-touch / bump / breakup cadence"
+                              >
+                                Add suggested cadence
+                              </button>
+                            </div>
+                            {(selectedLead.followUps || []).length === 0 ? (
+                              <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 text-center space-y-2">
+                                <CalendarClock className="h-6 w-6 text-slate-700 mx-auto" />
+                                <p className="text-xs text-slate-500">No follow-up tasks yet. Add one below or use the suggested cadence.</p>
+                              </div>
+                            ) : (
+                              <div className="space-y-2">
+                                {(selectedLead.followUps || []).map((t) => {
+                                  const overdue = t.status === 'open' && t.dueDate < new Date().toISOString().slice(0, 10);
+                                  return (
+                                    <div key={t.id} className={`p-2.5 rounded-xl border space-y-1.5 ${t.status === 'open' ? 'bg-slate-950 border-slate-850' : 'bg-slate-950/50 border-slate-800/60 opacity-70'}`}>
+                                      <div className="flex items-start justify-between gap-2">
+                                        <p className={`text-xs font-semibold ${t.status === 'open' ? 'text-slate-200' : 'text-slate-500 line-through'}`}>{t.title}</p>
+                                        <span className={`shrink-0 text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                                          overdue ? 'bg-red-500/10 text-red-400 border border-red-500/20'
+                                          : t.dueDate === new Date().toISOString().slice(0, 10) && t.status === 'open'
+                                            ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+                                            : 'bg-slate-800 text-slate-400'
+                                        }`}>
+                                          {t.status === 'done' ? 'Done' : t.status === 'skipped' ? 'Skipped' : overdue ? 'Overdue' : t.dueDate || 'No date'}
+                                        </span>
+                                      </div>
+                                      {t.notes && <p className="text-[11px] text-slate-500">{t.notes}</p>}
+                                      <div className="flex items-center gap-1.5">
+                                        {t.status === 'open' && (
+                                          <>
+                                            <button
+                                              onClick={() => handleCompleteTask(selectedLead.id, t.id)}
+                                              className="px-2 py-1 text-[10px] font-bold rounded bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 transition-all"
+                                            >
+                                              Done
+                                            </button>
+                                            <button
+                                              onClick={() => {
+                                                const reason = window.prompt('Reason for skipping (optional):', '');
+                                                if (reason === null) return;
+                                                handleSkipTask(selectedLead.id, t.id, reason);
+                                              }}
+                                              className="px-2 py-1 text-[10px] font-bold rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-all"
+                                            >
+                                              Skip
+                                            </button>
+                                          </>
+                                        )}
+                                        {t.status !== 'open' && (
+                                          <button
+                                            onClick={() => handleReopenTask(selectedLead.id, t.id)}
+                                            className="px-2 py-1 text-[10px] font-bold rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-all"
+                                          >
+                                            Reopen
+                                          </button>
+                                        )}
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                            <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                              <p className="text-[11px] font-bold uppercase tracking-wider text-slate-500">New task</p>
+                              <input
+                                type="text"
+                                placeholder="Task title…"
+                                value={taskDraft.title}
+                                onChange={(e) => setTaskDraft({ ...taskDraft, title: e.target.value })}
+                                className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 placeholder:text-slate-600"
+                              />
+                              <div className="flex gap-2">
+                                <input
+                                  type="date"
+                                  value={taskDraft.dueDate}
+                                  onChange={(e) => setTaskDraft({ ...taskDraft, dueDate: e.target.value })}
+                                  className="flex-1 bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                                />
+                                <select
+                                  value={taskDraft.priority}
+                                  onChange={(e) => setTaskDraft({ ...taskDraft, priority: e.target.value })}
+                                  className="bg-slate-900 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                                >
+                                  <option value="low">Low</option>
+                                  <option value="normal">Normal</option>
+                                  <option value="high">High</option>
+                                </select>
+                              </div>
+                              <input
+                                type="text"
+                                placeholder="Notes (optional)…"
+                                value={taskDraft.notes}
+                                onChange={(e) => setTaskDraft({ ...taskDraft, notes: e.target.value })}
+                                className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 placeholder:text-slate-600"
+                              />
+                              {taskFormError && <p className="text-[11px] text-red-400">{taskFormError}</p>}
+                              <button
+                                onClick={handleAddFollowUp}
+                                className="w-full px-3 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-xl transition-all"
+                              >
+                                Add follow-up
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* --- Email sequences tab (DRAFT-ONLY templates) --- */}
+                        {leadPanelTab === 'sequences' && selectedLead && (() => {
+                          const templates = listSequenceTemplates();
+                          const rendered = renderSequence(seqTemplateKey, selectedLead, activeCampaign, userProfile);
+                          const warnings = sequenceReadiness(selectedLead);
+                          return (
+                            <div className="space-y-3 pt-2">
+                              <div className="flex items-center justify-between">
+                                <span className="text-xs font-bold uppercase tracking-wider text-slate-400">Email Sequences</span>
+                                <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/20 text-amber-400 uppercase tracking-wider">
+                                  Draft only
+                                </span>
+                              </div>
+                              <p className="text-[11px] text-slate-500 leading-relaxed">
+                                Templates render as copy-and-paste drafts. This app never sends email —
+                                you send each draft yourself from your own inbox.
+                              </p>
+                              <div className="grid grid-cols-1 gap-1">
+                                {templates.map((t) => (
+                                  <button
+                                    key={t.key}
+                                    onClick={() => setSeqTemplateKey(t.key)}
+                                    className={`text-left px-3 py-2 rounded-xl border text-xs font-semibold transition-all ${
+                                      seqTemplateKey === t.key
+                                        ? 'bg-indigo-600/15 border-indigo-500/40 text-indigo-200'
+                                        : 'bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700'
+                                    }`}
+                                  >
+                                    {t.label}
+                                    <span className="ml-2 text-[10px] text-slate-500">{t.steps} steps</span>
+                                  </button>
+                                ))}
+                              </div>
+                              {warnings.length > 0 && (
+                                <div className="p-2.5 rounded-xl bg-amber-500/5 border border-amber-500/20 space-y-1">
+                                  {warnings.map((w, i) => (
+                                    <p key={i} className="text-[11px] text-amber-400/90 flex items-start space-x-1.5">
+                                      <MailWarning className="h-3.5 w-3.5 shrink-0 mt-px" />
+                                      <span>{w}</span>
+                                    </p>
+                                  ))}
+                                </div>
+                              )}
+                              <div className="space-y-3">
+                                {rendered.steps.map((step, i) => (
+                                  <div key={i} className="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                                    <div className="flex items-center justify-between">
+                                      <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                                        Day {step.day} · Step {i + 1}
+                                      </span>
+                                      <button
+                                        onClick={() => handleCopyToClipboard(`Subject: ${step.subject}\n\n${step.body}`, `seq_${i}`)}
+                                        className="flex items-center space-x-1 px-2 py-1 bg-slate-900 border border-slate-800 rounded-lg hover:bg-slate-800 text-indigo-400 hover:text-indigo-300 text-[10px] font-bold transition-all"
+                                      >
+                                        <Copy className="h-3 w-3" />
+                                        <span>Copy draft</span>
+                                      </button>
+                                    </div>
+                                    <p className="text-xs font-bold text-slate-200">Subject: {step.subject}</p>
+                                    <pre className="text-[11px] text-slate-400 leading-relaxed whitespace-pre-wrap font-sans">{step.body}</pre>
+                                    {step.missing.length > 0 && (
+                                      <p className="text-[10px] text-amber-400/80">
+                                        Fill in before sending: {step.missing.map((m) => `{{${m}}}`).join(', ')}
+                                      </p>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })()}
                       </>
                     ) : (
                       <div className="h-full flex flex-col items-center justify-center text-center p-6 space-y-3">
@@ -2850,6 +3436,328 @@ export default function App() {
                   </div>
 
                 </div>
+                </>
+                )}
+
+                {/* --- Follow-ups board tab --- */}
+                {dashTab === 'followups' && activeCampaign && (
+                  <div className="flex-1 overflow-y-auto px-6 py-5 space-y-4">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Task board</span>
+                      {campaignStats && (
+                        <>
+                          <span className="px-2.5 py-1 rounded-full bg-slate-800 text-slate-300 text-[11px] font-bold">{campaignStats.open} open</span>
+                          {campaignStats.overdue > 0 && (
+                            <span className="px-2.5 py-1 rounded-full bg-red-500/10 border border-red-500/20 text-red-400 text-[11px] font-bold">{campaignStats.overdue} overdue</span>
+                          )}
+                          {campaignStats.dueToday > 0 && (
+                            <span className="px-2.5 py-1 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-400 text-[11px] font-bold">{campaignStats.dueToday} due today</span>
+                          )}
+                          <span className="px-2.5 py-1 rounded-full bg-slate-800 text-slate-400 text-[11px] font-semibold">{campaignStats.done} done · {campaignStats.skipped} skipped</span>
+                        </>
+                      )}
+                    </div>
+                    {followUpsBoard.length === 0 ? (
+                      <div className="p-8 rounded-2xl bg-slate-900/40 border border-slate-800 text-center space-y-2">
+                        <CalendarClock className="h-8 w-8 text-slate-700 mx-auto" />
+                        <p className="text-sm text-slate-400 font-semibold">No follow-up tasks in this campaign.</p>
+                        <p className="text-xs text-slate-500">Select a lead and open its Follow-ups tab to add tasks or attach the suggested cadence.</p>
+                      </div>
+                    ) : (
+                      <div className="rounded-2xl bg-slate-900/40 border border-slate-800 overflow-hidden">
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="text-left text-slate-500 uppercase text-[10px] tracking-wider border-b border-slate-800">
+                              <th className="px-4 py-2.5">Task</th>
+                              <th className="px-4 py-2.5">Lead</th>
+                              <th className="px-4 py-2.5">Due</th>
+                              <th className="px-4 py-2.5">Priority</th>
+                              <th className="px-4 py-2.5">Status</th>
+                              <th className="px-4 py-2.5 text-right">Actions</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {followUpsBoard.map((t) => (
+                              <tr key={t.id} className="border-b border-slate-800/50 hover:bg-slate-900/60">
+                                <td className="px-4 py-2.5 font-semibold text-slate-200 max-w-[280px]">
+                                  <span className={t.status === 'open' ? '' : 'line-through text-slate-500'}>{t.title}</span>
+                                  {t.notes && <p className="text-[11px] text-slate-500 font-normal mt-0.5">{t.notes}</p>}
+                                </td>
+                                <td className="px-4 py-2.5 text-slate-400">{t.companyName}</td>
+                                <td className="px-4 py-2.5">
+                                  <span className={`font-mono text-[11px] ${t.overdue ? 'text-red-400 font-bold' : t.dueToday ? 'text-amber-400 font-bold' : 'text-slate-400'}`}>
+                                    {t.dueDate || '—'}
+                                  </span>
+                                </td>
+                                <td className="px-4 py-2.5">
+                                  <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                                    t.priority === 'high' ? 'bg-red-500/10 text-red-400'
+                                    : t.priority === 'low' ? 'bg-slate-800 text-slate-500'
+                                    : 'bg-indigo-500/10 text-indigo-300'
+                                  }`}>{t.priority}</span>
+                                </td>
+                                <td className="px-4 py-2.5">
+                                  <span className="text-[11px] text-slate-400 capitalize">{t.status}</span>
+                                </td>
+                                <td className="px-4 py-2.5 text-right whitespace-nowrap">
+                                  {t.status === 'open' ? (
+                                    <>
+                                      <button onClick={() => handleCompleteTask(t.leadId, t.id)} className="px-2 py-1 text-[10px] font-bold rounded bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 mr-1.5 transition-all">Done</button>
+                                      <button
+                                        onClick={() => {
+                                          const reason = window.prompt('Reason for skipping (optional):', '');
+                                          if (reason === null) return;
+                                          handleSkipTask(t.leadId, t.id, reason);
+                                        }}
+                                        className="px-2 py-1 text-[10px] font-bold rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-all"
+                                      >Skip</button>
+                                    </>
+                                  ) : (
+                                    <button onClick={() => handleReopenTask(t.leadId, t.id)} className="px-2 py-1 text-[10px] font-bold rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-all">Reopen</button>
+                                  )}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* --- Reports tab --- */}
+                {dashTab === 'reports' && (
+                  <div className="flex-1 overflow-y-auto px-6 py-5 space-y-5">
+                    <div className="flex items-center gap-3">
+                      <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Campaign</span>
+                      <select
+                        value={reportCampaignId || activeCampaignId}
+                        onChange={(e) => setReportCampaignId(e.target.value)}
+                        className="bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                      >
+                        {campaigns.map((c) => (
+                          <option key={c.id} value={c.id}>{c.businessInfo?.name || 'Untitled'} ({(c.leads || []).length} leads)</option>
+                        ))}
+                      </select>
+                    </div>
+                    {reportData ? (
+                      <>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                          {[
+                            { label: 'Total leads', value: reportData.total, color: 'text-slate-100' },
+                            { label: 'Contacted', value: reportData.contacted, color: 'text-emerald-400' },
+                            { label: 'Reply rate', value: `${reportData.replyRate}%`, color: 'text-indigo-400' },
+                            { label: 'Avg warmth', value: `${reportData.warmth.average}/100`, color: 'text-pink-400' },
+                            { label: 'Data quality', value: `${reportData.dataQuality}%`, color: 'text-cyan-400' },
+                            { label: 'Hot leads', value: reportData.warmth.hot, color: 'text-red-400' },
+                            { label: 'Open follow-ups', value: reportData.followUps.open, color: 'text-amber-400' },
+                            { label: 'Overdue tasks', value: reportData.followUps.overdue, color: 'text-red-400' },
+                          ].map((s, i) => (
+                            <div key={i} className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800 space-y-1">
+                              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">{s.label}</span>
+                              <p className={`text-2xl font-black ${s.color}`}>{s.value}</p>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                          <div className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800 space-y-3">
+                            <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">Pipeline funnel</h4>
+                            {reportData.funnel.map((f) => (
+                              <div key={f.stage} className="space-y-1">
+                                <div className="flex items-center justify-between text-[11px]">
+                                  <span className="text-slate-300 font-semibold">{f.stage}</span>
+                                  <span className="text-slate-500 font-mono">{f.count} · {f.pct}%</span>
+                                </div>
+                                <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
+                                  <div className="h-full bg-gradient-to-r from-indigo-500 to-pink-500 rounded-full" style={{ width: `${f.pct}%` }} />
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                          <div className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800 space-y-3">
+                            <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">Warmth distribution</h4>
+                            {reportData.warmthHistogram.map((b) => {
+                              const max = Math.max(1, ...reportData.warmthHistogram.map((x) => x.count));
+                              return (
+                                <div key={b.label} className="flex items-center gap-2">
+                                  <span className="text-[11px] text-slate-500 font-mono w-12">{b.label}</span>
+                                  <div className="flex-1 h-5 bg-slate-800/60 rounded overflow-hidden">
+                                    <div className="h-full bg-gradient-to-r from-amber-500 to-red-500" style={{ width: `${(b.count / max) * 100}%` }} />
+                                  </div>
+                                  <span className="text-[11px] text-slate-300 font-bold w-8 text-right">{b.count}</span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                          <div className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800 space-y-2">
+                            <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">Lead sources</h4>
+                            {reportData.sources.length === 0 && <p className="text-[11px] text-slate-600">No sources recorded yet.</p>}
+                            {reportData.sources.map((s) => (
+                              <div key={s.source} className="flex items-center justify-between text-[11px]">
+                                <span className="text-slate-300 font-semibold">{s.source}</span>
+                                <span className="text-slate-500 font-mono">{s.count} · {s.pct}%</span>
+                              </div>
+                            ))}
+                          </div>
+                          <div className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800 space-y-2">
+                            <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">Data completeness grades</h4>
+                            <div className="flex gap-2">
+                              {Object.entries(reportData.completenessGrades).map(([g, n]) => (
+                                <div key={g} className="flex-1 p-2.5 rounded-xl bg-slate-950 border border-slate-800 text-center">
+                                  <p className={`text-lg font-black ${g === 'A' ? 'text-emerald-400' : g === 'B' ? 'text-cyan-400' : g === 'C' ? 'text-amber-400' : g === 'D' ? 'text-orange-400' : 'text-red-400'}`}>{g}</p>
+                                  <p className="text-[11px] text-slate-500 font-bold">{n}</p>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                        {campaignCompareRows.length > 1 && (
+                          <div className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800 space-y-3">
+                            <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">Campaign comparison</h4>
+                            <div className="overflow-x-auto">
+                              <table className="w-full text-xs">
+                                <thead>
+                                  <tr className="text-left text-slate-500 uppercase text-[10px] tracking-wider border-b border-slate-800">
+                                    <th className="py-2 pr-3">Campaign</th>
+                                    <th className="py-2 pr-3">Leads</th>
+                                    <th className="py-2 pr-3">Avg warmth</th>
+                                    <th className="py-2 pr-3">Data quality</th>
+                                    <th className="py-2 pr-3">Reply rate</th>
+                                    <th className="py-2">Open tasks</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {campaignCompareRows.map((r) => (
+                                    <tr key={r.id} className="border-b border-slate-800/50 hover:bg-slate-900/60">
+                                      <td className="py-2 pr-3 font-semibold text-slate-200">{r.name}</td>
+                                      <td className="py-2 pr-3 text-slate-400">{r.leads}</td>
+                                      <td className="py-2 pr-3 text-slate-400">{r.avgWarmth}/100</td>
+                                      <td className="py-2 pr-3 text-slate-400">{r.dataQuality}%</td>
+                                      <td className="py-2 pr-3 text-slate-400">{r.replyRate}%</td>
+                                      <td className="py-2 text-slate-400">{r.openFollowUps}{r.overdue > 0 && <span className="text-red-400 font-bold"> ({r.overdue} overdue)</span>}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <p className="text-xs text-slate-500">No campaigns to report on.</p>
+                    )}
+                  </div>
+                )}
+
+                {/* --- Blacklist / do-not-contact tab --- */}
+                {dashTab === 'blacklist' && (
+                  <div className="flex-1 overflow-y-auto px-6 py-5 space-y-4">
+                    <div className="space-y-1">
+                      <h3 className="text-sm font-bold text-slate-100 flex items-center space-x-2">
+                        <Ban className="h-4 w-4 text-purple-400" />
+                        <span>Do-not-contact list</span>
+                      </h3>
+                      <p className="text-[11px] text-slate-500 leading-relaxed max-w-2xl">
+                        Leads matching any entry here are blocked from CSV imports and excluded from
+                        outreach drafts. Match by domain (blocks the company's website and email
+                        domain), exact email, or normalized company name.
+                      </p>
+                    </div>
+                    <div className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800 space-y-3">
+                      <p className="text-[11px] font-bold uppercase tracking-wider text-slate-500">Add entry</p>
+                      <div className="flex flex-col sm:flex-row gap-2">
+                        <select
+                          value={blDraft.type}
+                          onChange={(e) => setBlDraft({ ...blDraft, type: e.target.value })}
+                          className="bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-purple-500"
+                        >
+                          <option value="domain">Domain</option>
+                          <option value="email">Email</option>
+                          <option value="name">Company name</option>
+                        </select>
+                        <input
+                          type="text"
+                          placeholder={blDraft.type === 'domain' ? 'example.com' : blDraft.type === 'email' ? 'person@example.com' : 'Acme Dental'}
+                          value={blDraft.value}
+                          onChange={(e) => setBlDraft({ ...blDraft, value: e.target.value })}
+                          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleAddBlacklistEntry(); } }}
+                          className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-purple-500 placeholder:text-slate-600"
+                        />
+                        <input
+                          type="text"
+                          placeholder="Reason (optional)…"
+                          value={blDraft.reason}
+                          onChange={(e) => setBlDraft({ ...blDraft, reason: e.target.value })}
+                          className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-purple-500 placeholder:text-slate-600"
+                        />
+                        <button
+                          onClick={handleAddBlacklistEntry}
+                          className="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold rounded-xl transition-all"
+                        >
+                          Add
+                        </button>
+                      </div>
+                      {blFormError && <p className="text-[11px] text-red-400">{blFormError}</p>}
+                    </div>
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                          {blacklist.length} entr{blacklist.length === 1 ? 'y' : 'ies'}
+                        </span>
+                        <input
+                          type="text"
+                          placeholder="Search entries…"
+                          value={blQuery}
+                          onChange={(e) => setBlQuery(e.target.value)}
+                          className="bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-purple-500 placeholder:text-slate-600 w-48"
+                        />
+                      </div>
+                      {blacklist.length === 0 ? (
+                        <div className="p-6 rounded-2xl bg-slate-900/40 border border-slate-800 text-center">
+                          <p className="text-xs text-slate-500">List is empty. CSV imports currently pass through unchecked.</p>
+                        </div>
+                      ) : (
+                        <div className="rounded-2xl bg-slate-900/40 border border-slate-800 overflow-hidden">
+                          <table className="w-full text-xs">
+                            <thead>
+                              <tr className="text-left text-slate-500 uppercase text-[10px] tracking-wider border-b border-slate-800">
+                                <th className="px-4 py-2.5">Type</th>
+                                <th className="px-4 py-2.5">Value</th>
+                                <th className="px-4 py-2.5">Reason</th>
+                                <th className="px-4 py-2.5 text-right">Actions</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {blacklist
+                                .filter((e) => {
+                                  const q = blQuery.trim().toLowerCase();
+                                  if (!q) return true;
+                                  return (e.value || '').toLowerCase().includes(q) || (e.reason || '').toLowerCase().includes(q);
+                                })
+                                .map((e) => (
+                                  <tr key={e.id} className="border-b border-slate-800/50 hover:bg-slate-900/60">
+                                    <td className="px-4 py-2.5">
+                                      <span className="text-[10px] font-bold uppercase px-1.5 py-0.5 rounded bg-purple-500/10 border border-purple-500/20 text-purple-300">{e.type}</span>
+                                    </td>
+                                    <td className="px-4 py-2.5 font-mono text-slate-200">{e.value}</td>
+                                    <td className="px-4 py-2.5 text-slate-500">{e.reason || '—'}</td>
+                                    <td className="px-4 py-2.5 text-right">
+                                      <button
+                                        onClick={() => handleRemoveBlacklistEntry(e.id)}
+                                        className="px-2 py-1 text-[10px] font-bold rounded bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 transition-all"
+                                      >
+                                        Remove
+                                      </button>
+                                    </td>
+                                  </tr>
+                                ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
