@@ -652,3 +652,54 @@ console.log("All reporting tests passed.");
 }
 
 console.log("All tags tests passed.");
+
+// --- integration: import pipeline (CSV -> DNC gate -> source normalization) ---
+{
+  const csv = [
+    "Company,Website,Email,Contact Name,Contact Title,Source URL",
+    "Acme Dental,https://acme.com,jane@acme.com,Jane Smith,Owner,https://linkedin.com/company/acme",
+    "Evil Corp,https://blocked.example,boss@blocked.example,Boss,,",
+    "Spam LLC,,spam@blocked.example,,,",
+  ].join("\n");
+  const preview = importLeadsFromCSV(csv);
+  assert.equal(preview.leads.length, 3);
+
+  const bl = [
+    createBlacklistEntry({ type: "domain", value: "blocked.example", reason: "spam" }),
+  ];
+  const gate = checkImportAgainstBlacklist(preview.leads, bl);
+  assert.equal(gate.blockedCount, 2); // domain match + email-domain match
+  assert.equal(gate.allowed.length, 1);
+  assert.ok(gate.notes[0].includes("blocked by"));
+
+  const final = gate.allowed.map(normalizeLeadSource);
+  assert.equal(final[0].source, "LinkedIn"); // normalized from Source URL
+
+  // follow-up round-trip on a lead object, the shape the UI mutates
+  const lead = { ...final[0], id: "l1", followUps: [] };
+  const t1 = createFollowUp(lead.id, { title: "Call Jane", dueDate: "2026-10-23", priority: "high" });
+  lead.followUps = [...lead.followUps, t1];
+  lead.followUps = lead.followUps.map((t) => (t.id === t1.id ? completeFollowUp(t) : t));
+  assert.equal(lead.followUps[0].status, "done");
+  assert.ok(lead.followUps[0].completedAt);
+
+  // warmth engine agrees the imported lead is well-formed
+  const { score, tier } = scoreLeadWarmth(lead);
+  assert.ok(score >= 50, `expected decent warmth, got ${score}`);
+  assert.ok(["Hot", "Warm", "Lukewarm"].includes(tier));
+
+  // sequences render against the same lead without crashing
+  const seq = renderSequence("email_cold", lead, { businessInfo: { targetIndustry: "dental", targetLocation: "Winnipeg" } }, { senderName: "Jay", senderCompany: "Gutter Genie" });
+  assert.equal(seq.draft, true);
+  assert.equal(seq.sendable, false);
+  assert.equal(seq.steps.length, 3);
+  assert.ok(seq.steps[0].subject.includes("Acme Dental"));
+  assert.equal(DRAFT_ONLY, true);
+
+  // empty blacklist lets everything through
+  const open = checkImportAgainstBlacklist(preview.leads, []);
+  assert.equal(open.blockedCount, 0);
+  assert.equal(open.allowed.length, 3);
+}
+
+console.log("All integration tests passed.");

@@ -22,7 +22,28 @@ Solana Web3-gated B2B lead sourcing app. Describe a business, verify a SOL payme
   dashboard, preview how rows map (with duplicates and skips listed), then import
   as a new campaign. See "CSV import format" below.
 - **Batch actions** — select multiple leads (checkboxes), apply one status to all,
-  or delete them in one go. The selection follows the current search/filter/sort.
+  add/remove a tag across all selected leads, or delete them in one go. The
+  selection follows the current search/filter/sort.
+- **Lead workspace** — clicking a lead opens four tabs: **Profile** (contact
+  details, outreach copy, notes, per-lead tag editor), **Warmth** (deterministic
+  reachability score 0–100 with a per-signal breakdown: email, email domain,
+  website, LinkedIn, contact identity, phone), **Follow-ups** (task list with
+  overdue/due-today badges, add/complete/skip/reopen, one-click suggested
+  initial-touch → bump → breakup cadence), and **Sequences** (warm intro, cold
+  outreach, and referral email templates rendered as copy-and-paste **drafts
+  only** — the app never sends email; missing placeholders are flagged before
+  you copy).
+- **Follow-ups board** — the dashboard's Follow-ups tab shows every open task
+  across the campaign (overdue first), with campaign-wide counts and quick
+  done/skip/reopen actions.
+- **Reports** — per-campaign performance: total leads, contacted count, reply
+  rate, average warmth, data quality, pipeline funnel, warmth histogram, lead
+  source breakdown, completeness grades, plus a head-to-head table when you
+  have more than one campaign.
+- **Do-not-contact list** — block by domain (matches website and email domain),
+  exact email, or company name. Entries live in `localStorage`; CSV import
+  previews check every row against the list and block matches with the reason
+  shown before you confirm the import.
 - **Data-quality scoring** — every lead gets a 0–100 completeness score (grade
   A–F, hover for missing fields) plus a sortable "Data Quality" column; the
   dashboard metrics bar shows the campaign average.
@@ -136,9 +157,11 @@ Total 0–100 → grade A (90+) / B (75+) / C (55+) / D (35+) / F. Hovering a le
 
 ## Tests
 
-Pure logic (dedupe + fuzzy dedupe, validation, error classification, prospecting
-kit, CSV helpers, CSV import, scoring) lives in `src/lib/leads.js` and is
-covered by a node assertion suite:
+Pure logic lives in `src/lib/` (dedupe, validation, CSV, warmth scoring,
+follow-up tasks, draft email sequences, blacklist, source attribution,
+campaign reporting, tags) and is covered by a node assertion suite —
+including an end-to-end import-pipeline test (CSV → do-not-contact gate →
+source normalization → follow-up round-trip → sequence render):
 
 ```bash
 npm test   # runs scripts/test-helpers.mjs
