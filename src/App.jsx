@@ -112,12 +112,18 @@ import {
   PhoneCall
 } from 'lucide-react';
 
-// Gemini API key injected at build time via Vercel env var (VITE_GEMINI_API_KEY).
-// Optional/keyless-first: without it, live AI lead generation is disabled with a
-// clear on-screen message, while the Sample Campaign, campaign manager, CSV
-// export, payment flow, and session recovery keep working.
-const apiKey = import.meta.env.VITE_GEMINI_API_KEY || "";
-const HAS_GEMINI_KEY = apiKey.length > 0;
+// Gemini calls go through /api/gemini (a serverless function holding the
+// real key server-side) instead of calling Google directly from the
+// browser -- see api/gemini.js. hasGeminiKey used to be a build-time
+// constant read from import.meta.env.VITE_GEMINI_API_KEY, but any
+// VITE_-prefixed var gets inlined into the public JS bundle, so that key
+// was extractable by anyone who opened dev tools. Whether a key is
+// configured is now discovered at runtime via a status check against the
+// proxy (see the useEffect below), which only ever answers true/false,
+// never the key itself. Optional/keyless-first stays the same: without a
+// key, live AI lead generation is disabled with a clear on-screen message,
+// while the Sample Campaign, campaign manager, CSV export, payment flow,
+// and session recovery keep working.
 
 // Merchant wallet address where users send their SOL payments
 const MERCHANT_SOL_ADDRESS = "GvD3Z9A4p91L3P7wR4p1kU86X91Z8qVbL6p7qWeR8tY"; 
@@ -128,6 +134,16 @@ export default function App() {
   const [activeCampaignId, setActiveCampaignId] = useState(null);
   const [viewMode, setViewMode] = useState('welcome'); // welcome, wizard, payment, dashboard
   const [loading, setLoading] = useState(false);
+  // Discovered at runtime from /api/gemini's GET status check (true/false
+  // only, never the key) instead of a build-time env var -- see the note
+  // near the top of this file on why.
+  const [hasGeminiKey, setHasGeminiKey] = useState(false);
+  useEffect(() => {
+    fetch('/api/gemini')
+      .then(r => r.json())
+      .then(d => setHasGeminiKey(!!(d && d.hasKey)))
+      .catch(() => setHasGeminiKey(false));
+  }, []);
   const [loadingStep, setLoadingStep] = useState(0);
   const [apiError, setApiError] = useState(null);
   const [copiedId, setCopiedId] = useState(null);
@@ -197,7 +213,7 @@ export default function App() {
   const [userProfile, setUserProfile] = useState({
     senderName: 'John Doe',
     senderCompany: 'My Growth Agency',
-    userWalletAddress: '1'
+    userWalletAddress: ''
   });
 
   // Crypto / Payment States
@@ -390,7 +406,7 @@ export default function App() {
 
   // Helper function for exponential backoff API calls
   async function callGeminiWithRetry(payload, retries = 5, delay = 1000) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+    const url = '/api/gemini';
     
     for (let i = 0; i < retries; i++) {
       try {
@@ -412,9 +428,10 @@ export default function App() {
         const errorText = await response.text();
         throw new Error(`API error (${response.status}): ${errorText}`);
       } catch (error) {
-        // Client errors (bad key, bad request, forbidden) will never succeed
-        // on retry — fail fast so the user gets the real message immediately.
-        if (/API error \((400|401|403)\)/.test(error.message)) throw error;
+        // Client errors (bad key, bad request, forbidden) and the proxy's
+        // "no server key configured" (503) will never succeed on retry —
+        // fail fast so the user gets the real message immediately.
+        if (/API error \((400|401|403|503)\)/.test(error.message)) throw error;
         if (i === retries - 1) throw error;
         await new Promise(res => setTimeout(res, delay * Math.pow(2, i)));
       }
@@ -423,15 +440,8 @@ export default function App() {
 
   // Verify Solana Payment with Strict Abuse / Multi-Session check
   const handleVerifyPayment = async () => {
-    // Free-access bypass: wallet address "1" (default) skips payment verification
-    if (userProfile.userWalletAddress.trim() === '1') {
-      setVerifyingPayment(true);
-      setPaymentVerified(true);
-      setPaymentStatusMessage('✅ Access granted. Sourcing leads...');
-      setTimeout(() => {
-        generateLeadsCampaign();
-      }, 800);
-      setVerifyingPayment(false);
+    if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(userProfile.userWalletAddress.trim())) {
+      setPaymentStatusMessage("Please enter your Solana wallet address in your profile first — it's used to verify the payment came from you.");
       return;
     }
 
@@ -663,7 +673,7 @@ export default function App() {
   const generateLeadsCampaign = async () => {
     // Keyless-first: refuse early with a clear message instead of a cryptic
     // API 400 from the backend. Everything else in the app works without a key.
-    if (!HAS_GEMINI_KEY) {
+    if (!hasGeminiKey) {
       setApiError(
         "Live lead generation needs a Gemini API key. Add VITE_GEMINI_API_KEY to your .env file " +
         "(see .env.example), rebuild, and redeploy — or load the free Sample Campaign from the sidebar " +
@@ -1480,17 +1490,17 @@ export default function App() {
 
           {/* Honest key status: shows at a glance whether AI generation is live */}
           <span
-            title={HAS_GEMINI_KEY
+            title={hasGeminiKey
               ? "Gemini API key detected — live AI lead generation enabled"
               : "No Gemini API key — live generation disabled, keyless features still work"}
             className={`hidden sm:inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider border ${
-              HAS_GEMINI_KEY
+              hasGeminiKey
                 ? 'bg-emerald-500/10 border-emerald-500/25 text-emerald-400'
                 : 'bg-amber-500/10 border-amber-500/25 text-amber-400'
             }`}
           >
-            <span className={`h-1.5 w-1.5 rounded-full ${HAS_GEMINI_KEY ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'}`} />
-            <span>{HAS_GEMINI_KEY ? 'AI Live' : 'Keyless'}</span>
+            <span className={`h-1.5 w-1.5 rounded-full ${hasGeminiKey ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'}`} />
+            <span>{hasGeminiKey ? 'AI Live' : 'Keyless'}</span>
           </span>
 
           {/* Account Settings Trigger */}
@@ -2332,7 +2342,7 @@ export default function App() {
                   </div>
 
                   {/* Keyless notice: live AI generation needs a key; everything else works */}
-                  {!HAS_GEMINI_KEY && (
+                  {!hasGeminiKey && (
                     <div className="p-4 rounded-xl bg-amber-950/30 border border-amber-500/20 space-y-3">
                       <div className="flex items-start space-x-3 text-xs text-amber-200/90 leading-relaxed">
                         <AlertCircle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />

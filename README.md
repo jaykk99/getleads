@@ -71,19 +71,27 @@ The app reads/writes campaigns and your profile from `localStorage`, fetches the
 
 ## Configuration
 
-- `VITE_GEMINI_API_KEY` (build-time env var, documented in `.env.example`) — **optional**.
+- `GEMINI_API_KEY` (plain server env var, set in your Vercel project settings
+  — **not** `VITE_GEMINI_API_KEY`, and documented in `.env.example`) — **optional**.
   Without it, the app runs keyless: the welcome screen, free Sample Campaign,
   campaign manager, CSV export, payment verification flow, and session-recovery
   scan all work client-side. Live AI lead generation (Gemini 2.5 Flash + Google
   Search grounding) shows a clear "key missing" message instead of failing
-  cryptically — add the key to `.env`, rebuild, and redeploy to enable it.
+  cryptically — set the key in Vercel's env vars and redeploy to enable it
+  (no need to rebuild the Vite app; `api/gemini.js` reads the key fresh on
+  each cold start). The frontend calls `/api/gemini`, never Google
+  directly, so the key never reaches the browser.
 - `MERCHANT_SOL_ADDRESS` in `src/App.jsx` — the wallet that receives SOL payments
   (default is the owner's address; change it to yours if you self-host this).
-- Free-access bypass for testing: set "Your Solana Wallet Address" in the
-  Personalization Profile to `1` and payment verification is skipped (no SOL
-  leaves your wallet).
 
-> Note: this app calls the Gemini `generativelanguage` API from the browser. For production, proxy these calls through a backend so the API key is never exposed client-side.
+Previously this app called the Gemini `generativelanguage` API directly from
+the browser with a `VITE_`-prefixed key, which Vite inlines into the public
+JS bundle — meaning the real key was extractable by anyone who opened dev
+tools on the live site. It's now proxied through `api/gemini.js` (a Vercel
+serverless function) so the key stays server-side. There was also a
+free-access bypass (wallet address `1` skipped payment verification), whose
+default value was *also* `1` — meaning every user got free access by
+default. Both have been removed.
 
 ## Payment verification (how it works)
 
