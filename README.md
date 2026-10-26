@@ -1,7 +1,6 @@
 # GET LEADS
 
-Live: https://project-d3cxp.vercel.app (currently returns 402 — the Vercel
-team is paused; the code builds and runs clean locally)
+Live: none — the Vercel team is paused; the code builds and runs clean locally
 
 Solana Web3-gated B2B lead sourcing app. Describe a business, verify a SOL payment on-chain, and source matching B2B leads with personalized outreach templates — all powered by live search grounding.
 
@@ -128,7 +127,7 @@ Example:
 
 ```csv
 Company,Website,Contact Name,Email,Phone,Score
-Acme Dental,https://acme.com,Jane Smith,jane@acme.com,204-555-0100,92
+Acme Dental,,Jane Smith,jane@acme.com,204-555-0100,92
 Beta Roofing,,Bob,bob@beta.com,,60
 ```
 
