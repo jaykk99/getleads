@@ -136,7 +136,26 @@ export const SEQUENCE_TEMPLATES = {
   },
 };
 
-/** List available template keys + labels for the UI picker. */
+/**
+ * Merge AI-generated outreach templates over the built-in defaults.
+ * A missing, blank, or non-string key keeps the default for that slot, so
+ * a partial model response never wipes a template with `undefined`. A
+ * non-object `parsed` (e.g. the model returned a bare string) keeps all
+ * defaults. Callers still wrap JSON.parse in try/catch — this only merges.
+ */
+export function mergeOutreachTemplates(parsed, fallback) {
+  const p = parsed && typeof parsed === "object" ? parsed : {};
+  const f = fallback || {};
+  const pick = (key) => {
+    const v = p[key];
+    return typeof v === "string" && v.trim() ? v : f[key];
+  };
+  return {
+    warmEmail: pick("warmEmail"),
+    coldCallScript: pick("coldCallScript"),
+    linkedinMessage: pick("linkedinMessage"),
+  };
+}
 export function listSequenceTemplates() {
   return Object.entries(SEQUENCE_TEMPLATES).map(([key, t]) => ({ key, label: t.label, steps: t.steps.length }));
 }

@@ -53,7 +53,13 @@ import {
   buildSequenceContext,
   renderSequence,
   sequenceReadiness,
+  mergeOutreachTemplates,
 } from "../src/lib/sequences.js";
+import {
+  getTierPriceUSD,
+  tierPriceSOL,
+  tierForSolAmount,
+} from "../src/lib/pricing.js";
 import {
   validateBlacklistEntry,
   createBlacklistEntry,
@@ -315,7 +321,7 @@ console.log("All helper tests passed.");
   // no website on file -> domain can't mismatch, counts as corporate
   assert.equal(gradeEmailDomain("jane@acme.com", "").kind, "corporate");
 
-  // scoreDomainQuality: 0..30
+  // scoreDomainQuality: 0..26 (base 22 + 4 premium TLD)
   {
     const q = scoreDomainQuality("https://acme.com");
     assert.ok(q.points > 20 && q.points <= 30);
@@ -367,6 +373,46 @@ console.log("All helper tests passed.");
   assert.equal(warmthTier(25), "Lukewarm");
   assert.equal(warmthTier(24), "Cold");
   assert.equal(warmthTier(0), "Cold");
+
+  // fully-loaded lead (3+ social profiles) scores the full 100: the website
+  // signal must reach its documented 20, not cap at 17 on a /30 scale
+  const perfect = {
+    ...hotLead,
+    socialProfiles: ["https://twitter.com/acme", "https://x.com/acme", "https://facebook.com/acme"],
+  };
+  const perfectWarm = scoreLeadWarmth(perfect);
+  assert.equal(perfectWarm.score, 100);
+  assert.equal(perfectWarm.signals.find((s) => s.label === "Website").points, 20);
+  assert.equal(scoreDomainQuality("https://acme.com").points, 26);
+
+  // pricing: tierForSolAmount prices tiers in USD at the LIVE SOL price —
+  // a payment only buys the tiers it covers (recovery must not undercharge)
+  assert.equal(getTierPriceUSD("10000"), 660);
+  assert.equal(getTierPriceUSD("15"), 1);
+  assert.equal(getTierPriceUSD("bogus"), 1); // unknown tier -> cheapest
+  assert.ok(Math.abs(tierPriceSOL("10000", 148.5) - 660 / 148.5) < 1e-9);
+  assert.equal(tierForSolAmount(1.6, 148.5), "1500"); // ~$238 buys the $100 tier, not $660
+  assert.equal(tierForSolAmount(4.5, 148.5), "10000");
+  assert.equal(tierForSolAmount(0.07, 148.5), "150"); // ~$10.40 buys the $10 tier
+  assert.equal(tierForSolAmount(0.0068, 148.5), "15"); // ~$1.01 buys the $1 tier
+  assert.equal(tierForSolAmount(0.005, 148.5), null); // ~$0.74 buys nothing
+  assert.equal(tierForSolAmount(1.6, 440), "10000"); // same SOL buys more when SOL is dearer
+  assert.equal(tierForSolAmount(0, 148.5), null);
+  assert.equal(tierForSolAmount(1.6, 0), null);
+
+  // mergeOutreachTemplates: partial / malformed AI output never wipes a template
+  const outreachDefaults = { warmEmail: "D warm", coldCallScript: "D call", linkedinMessage: "D in" };
+  assert.deepEqual(
+    mergeOutreachTemplates({ warmEmail: "custom" }, outreachDefaults),
+    { warmEmail: "custom", coldCallScript: "D call", linkedinMessage: "D in" }
+  );
+  assert.deepEqual(mergeOutreachTemplates({}, outreachDefaults), outreachDefaults);
+  assert.deepEqual(mergeOutreachTemplates(null, outreachDefaults), outreachDefaults);
+  assert.deepEqual(mergeOutreachTemplates("a string", outreachDefaults), outreachDefaults);
+  assert.equal(
+    mergeOutreachTemplates({ warmEmail: "   ", coldCallScript: "x", linkedinMessage: "y" }, outreachDefaults).warmEmail,
+    "D warm"
+  );
 
   // campaignWarmthDistribution + rankLeadsByWarmth
   const dist = campaignWarmthDistribution([hotLead, { companyName: "Ghost Co" }]);

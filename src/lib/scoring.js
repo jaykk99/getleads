@@ -73,9 +73,15 @@ export function gradeEmailDomain(email, leadWebsite) {
 }
 
 /**
- * Grade website domain quality 0..30.
+ * Grade website domain quality 0..DOMAIN_QUALITY_MAX.
  * penalizes throwaway-looking domains (hyphens, digits, odd TLDs).
+ *
+ * The ceiling is 26, not 30: base 22 + 4 for a recognized commercial TLD,
+ * with no further bonuses. scoreLeadWarmth scales by this constant, so a
+ * perfect domain earns the full 20 website points there.
  */
+export const DOMAIN_QUALITY_MAX = 26;
+
 export function scoreDomainQuality(website) {
   const domain = normalizeDomain(website);
   if (!domain) return { points: 0, reasons: ["No website on file."] };
@@ -149,9 +155,9 @@ export function scoreLeadWarmth(lead) {
     add("Email domain", 0, grade.reason);
   }
 
-  // --- Website domain quality (20 of the 30-scale) -------------------------
+  // --- Website domain quality (20, scaled from the DOMAIN_QUALITY_MAX grade) ---
   const dq = scoreDomainQuality(l.website);
-  const dqPoints = Math.round((dq.points / 30) * 20);
+  const dqPoints = Math.round((dq.points / DOMAIN_QUALITY_MAX) * 20);
   score += dqPoints;
   add("Website", dqPoints, dq.reasons.join(" "));
 

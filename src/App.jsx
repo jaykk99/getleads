@@ -33,7 +33,12 @@ import {
   listSequenceTemplates,
   renderSequence,
   sequenceReadiness,
+  mergeOutreachTemplates,
 } from './lib/sequences.js';
+import {
+  getTierPriceUSD,
+  tierForSolAmount,
+} from './lib/pricing.js';
 import {
   createBlacklistEntry,
   upsertBlacklistEntry,
@@ -223,17 +228,9 @@ export default function App() {
     targetRole: 'Owner / Marketing Director / Decision Maker',
   });
 
-  // Calculate costs
-  const getTierPriceUSD = (tier) => {
-    switch (tier) {
-      case '15': return 1.00;
-      case '150': return 10.00;
-      case '1500': return 100.00;
-      case '10000': return 660.00;
-      default: return 1.00;
-    }
-  };
-
+  // Tier prices live in src/lib/pricing.js (single source of truth, shared
+  // with the recovery-tier matcher so both paths price in USD at the live
+  // SOL price). requiredSOL is what the verify flow charges.
   const requiredSOL = (getTierPriceUSD(selectedLeadTier) / solPriceUSD).toFixed(5);
 
   // Initialize Session Token (helps bind payments uniquely to this browser session)
@@ -256,9 +253,18 @@ export default function App() {
     }
   }, []);
 
-  // Save Claim to Registry
+  // Save Claim to Registry — read the registry fresh from localStorage on
+  // every claim instead of spreading the render-time state snapshot, so a
+  // claim made before a re-render (or from the recovery flow right after a
+  // verify) cannot silently drop a claim recorded in between.
   const recordSignatureClaim = (signature, session) => {
-    const updated = { ...claimedSignatures, [signature]: session };
+    let registry = {};
+    try {
+      registry = JSON.parse(localStorage.getItem('get_leads_claimed_registry') || '{}') || {};
+    } catch {
+      registry = {};
+    }
+    const updated = { ...registry, [signature]: session };
     setClaimedSignatures(updated);
     localStorage.setItem('get_leads_claimed_registry', JSON.stringify(updated));
   };
@@ -281,9 +287,14 @@ export default function App() {
     if (savedCampaigns) {
       try {
         const parsed = JSON.parse(savedCampaigns);
-        if (parsed && parsed.length > 0) {
-          setCampaigns(parsed);
-          setActiveCampaignId(parsed[0].id);
+        // Shape-check: a corrupt/hand-edited entry (or an older schema) must
+        // not crash the dashboard — only campaigns with a leads array load.
+        const valid = Array.isArray(parsed)
+          ? parsed.filter((c) => c && typeof c === 'object' && Array.isArray(c.leads))
+          : [];
+        if (valid.length > 0) {
+          setCampaigns(valid);
+          setActiveCampaignId(valid[0].id);
           setViewMode('dashboard');
         }
       } catch (e) {
@@ -617,15 +628,18 @@ export default function App() {
             const lamports = tx.meta.postBalances[merchantIdx] - tx.meta.preBalances[merchantIdx];
             const solTransferred = lamports / 1_000_000_000;
 
-            // Match amount to a tier
+            // Match amount to a tier by what the payment actually covers at
+            // the LIVE SOL price — never hardcoded SOL thresholds, which
+            // undercharge whenever SOL moves (1.5 SOL was ~$660 at $440/SOL
+            // but is only ~$223 at $148/SOL). A payment below the cheapest
+            // tier is not a valid purchase; keep scanning for another tx.
             if (solTransferred > 0.005) { // Valid non-trivial transfer
-              foundUnclaimedValidTx = cleanSig;
-              // Set tier accordingly based on approximate pricing values
-              if (solTransferred > 1.5) targetTierFound = '10000';
-              else if (solTransferred > 0.4) targetTierFound = '1500';
-              else if (solTransferred > 0.04) targetTierFound = '150';
-              else targetTierFound = '15';
-              break;
+              const tier = tierForSolAmount(solTransferred, solPriceUSD);
+              if (tier) {
+                foundUnclaimedValidTx = cleanSig;
+                targetTierFound = tier;
+                break;
+              }
             }
           }
         }
@@ -901,12 +915,14 @@ export default function App() {
       };
 
       if (outreachText) {
-        const parsedOutreach = JSON.parse(outreachText);
-        outreachTemplates = {
-          warmEmail: parsedOutreach.warmEmail,
-          coldCallScript: parsedOutreach.coldCallScript,
-          linkedinMessage: parsedOutreach.linkedinMessage
-        };
+        // A bad or partial outreach payload must not wipe the defaults or
+        // kill the campaign — the leads above are already generated. Missing
+        // keys keep their default template; malformed JSON keeps all three.
+        try {
+          outreachTemplates = mergeOutreachTemplates(JSON.parse(outreachText), outreachTemplates);
+        } catch (e) {
+          console.warn("Outreach templates were unusable; keeping defaults:", e);
+        }
       }
 
       // Consolidate Campaign data
@@ -1084,7 +1100,7 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.setAttribute("href", url);
-    link.setAttribute("download", `get_leads_${activeCampaign.businessInfo.name.toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 40) || 'campaign'}.csv`);
+    link.setAttribute("download", `get_leads_${(activeCampaign.businessInfo?.name || 'campaign').toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 40) || 'campaign'}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
