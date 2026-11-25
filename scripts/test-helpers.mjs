@@ -315,10 +315,12 @@ console.log("All helper tests passed.");
   // no website on file -> domain can't mismatch, counts as corporate
   assert.equal(gradeEmailDomain("jane@acme.com", "").kind, "corporate");
 
-  // scoreDomainQuality: 0..30
+  // scoreDomainQuality: 0..30 — a clean premium-TLD domain hits the ceiling,
+  // so a fully-loaded lead can actually reach 100 (was capped at 26/30 -> 97).
   {
     const q = scoreDomainQuality("https://acme.com");
     assert.ok(q.points > 20 && q.points <= 30);
+    assert.equal(q.points, 30);
     assert.equal(scoreDomainQuality("").points, 0);
     const odd = scoreDomainQuality("https://my-shop-1234.xyz");
     assert.ok(odd.points < q.points);
@@ -340,6 +342,14 @@ console.log("All helper tests passed.");
   assert.ok(hot.score >= 75);
   assert.ok(hot.signals.length >= 8);
   assert.ok(hot.signals.every((s) => typeof s.points === "number"));
+
+  // A fully-loaded lead (3 social profiles) can reach the 100 ceiling.
+  const perfect = scoreLeadWarmth({
+    ...hotLead,
+    socialProfiles: ["https://twitter.com/acme", "https://facebook.com/acme", "https://instagram.com/acme"],
+  });
+  assert.equal(perfect.score, 100);
+  assert.equal(perfect.signals.find((s) => s.label === "Website").points, 20);
 
   const cold = scoreLeadWarmth({ companyName: "Ghost Co" });
   assert.equal(cold.tier, "Cold");

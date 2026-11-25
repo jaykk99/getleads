@@ -79,7 +79,7 @@ export function gradeEmailDomain(email, leadWebsite) {
 export function scoreDomainQuality(website) {
   const domain = normalizeDomain(website);
   if (!domain) return { points: 0, reasons: ["No website on file."] };
-  let points = 22;
+  let points = 26;
   const reasons = [`Website present (${domain}).`];
   const tld = domain.split(".").pop();
   const PREMIUM_TLDS = new Set(["com", "io", "co", "net", "org", "ca", "us", "uk", "de", "au", "dev", "app"]);

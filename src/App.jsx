@@ -256,9 +256,16 @@ export default function App() {
     }
   }, []);
 
-  // Save Claim to Registry
+  // Save Claim to Registry (read-through from localStorage so rapid
+  // successive claims can't clobber each other via a stale state closure).
   const recordSignatureClaim = (signature, session) => {
-    const updated = { ...claimedSignatures, [signature]: session };
+    let registry = {};
+    try {
+      registry = JSON.parse(localStorage.getItem('get_leads_claimed_registry') || '{}') || {};
+    } catch (e) {
+      registry = {};
+    }
+    const updated = { ...registry, [signature]: session };
     setClaimedSignatures(updated);
     localStorage.setItem('get_leads_claimed_registry', JSON.stringify(updated));
   };
@@ -405,6 +412,9 @@ export default function App() {
         }
         
         if (response.status === 429) {
+          if (i === retries - 1) {
+            throw new Error(`API error (429): Gemini rate limit persisted after ${retries} retries. Wait a minute and try again.`);
+          }
           await new Promise(res => setTimeout(res, delay * Math.pow(2, i)));
           continue;
         }
@@ -485,6 +495,13 @@ export default function App() {
       const tx = result.result;
       if (!tx) {
         throw new Error("Transaction signature not yet logged on-chain. Please wait for confirmation.");
+      }
+
+      // A failed transaction rolls its transfers back — only fees move. The
+      // amount check below would catch it, but reject it explicitly so the
+      // error message says what actually happened.
+      if (tx.meta?.err) {
+        throw new Error("That transaction failed on-chain, so no payment was made. Send a new payment and try again.");
       }
 
       const accountKeys = tx.transaction.message.accountKeys;
@@ -603,7 +620,15 @@ export default function App() {
         const tx = txResult.result;
 
         if (tx) {
+          // Skip failed transactions (no transfer happened) and transactions
+          // the recovery wallet did not send: getSignaturesForAddress returns
+          // any tx the wallet is merely involved in, so without the sender
+          // check anyone could claim a payment made by someone else in a
+          // shared / multi-party transaction.
+          if (tx.meta?.err) continue;
           const accountKeys = tx.transaction.message.accountKeys;
+          const sender = accountKeys[0];
+          if (sender !== targetWallet) continue;
           const merchantIdx = accountKeys.indexOf(MERCHANT_SOL_ADDRESS);
 
           if (merchantIdx !== -1) {
@@ -617,14 +642,18 @@ export default function App() {
             const lamports = tx.meta.postBalances[merchantIdx] - tx.meta.preBalances[merchantIdx];
             const solTransferred = lamports / 1_000_000_000;
 
-            // Match amount to a tier
-            if (solTransferred > 0.005) { // Valid non-trivial transfer
+            // Match amount to a tier using the SAME live pricing as the
+            // verify path (tier USD / live SOL price, 0.002 tolerance).
+            // The old hardcoded SOL thresholds granted tiers at ~40-60% of
+            // list price (e.g. 0.4 SOL bought the $100 tier at $148/SOL).
+            const tiersDesc = ['10000', '1500', '150', '15'];
+            let matchedTier = null;
+            for (const t of tiersDesc) {
+              if (solTransferred >= getTierPriceUSD(t) / solPriceUSD - 0.002) { matchedTier = t; break; }
+            }
+            if (matchedTier) {
               foundUnclaimedValidTx = cleanSig;
-              // Set tier accordingly based on approximate pricing values
-              if (solTransferred > 1.5) targetTierFound = '10000';
-              else if (solTransferred > 0.4) targetTierFound = '1500';
-              else if (solTransferred > 0.04) targetTierFound = '150';
-              else targetTierFound = '15';
+              targetTierFound = matchedTier;
               break;
             }
           }
@@ -646,9 +675,10 @@ export default function App() {
 
       setRecoveryStatus(`✅ Unclaimed transaction verified! Bound signature ${foundUnclaimedValidTx.substring(0, 10)}... to your session. Sourcing leads list now.`);
       
-      // Auto-trigger generation
+      // Auto-trigger generation with the tier this payment actually bought
+      // (passed explicitly — the setSelectedLeadTier above is async).
       setTimeout(() => {
-        generateLeadsCampaign();
+        generateLeadsCampaign(targetTierFound);
       }, 1500);
 
     } catch (err) {
@@ -659,8 +689,11 @@ export default function App() {
     }
   };
 
-  // Run lead generation with real search grounding
-  const generateLeadsCampaign = async () => {
+  // Run lead generation with real search grounding.
+  // tierOverride: the recovery flow passes the tier it just matched, because
+  // setSelectedLeadTier is async and this closure would otherwise read the
+  // tier selected BEFORE the recovery ran (a $100 recovery generating 15 leads).
+  const generateLeadsCampaign = async (tierOverride) => {
     // Keyless-first: refuse early with a clear message instead of a cryptic
     // API 400 from the backend. Everything else in the app works without a key.
     if (!HAS_GEMINI_KEY) {
@@ -738,7 +771,7 @@ export default function App() {
       // Step 2: Search Grounding to find real-world leads
       const searchNiche = formData.targetIndustry || businessAnalysis.suggestedTargetSectors[0];
       const searchLoc = formData.targetLocation || "United States";
-      const leadQty = parseInt(selectedLeadTier) || 15;
+      const leadQty = parseInt(tierOverride || selectedLeadTier) || 15;
 
       const leadSearchPrompt = `
         You are an elite B2B pipeline builder working ONLY from live Google search results.
